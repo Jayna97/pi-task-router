@@ -84,8 +84,8 @@ cp <REPO_DIR>/task-router.example.json ~/.pi/agent/task-router.json
 |---|---|
 | `models` | 代号 → `{ provider, id, desc }`。代号须匹配 `[a-z][a-z0-9_-]*` |
 | `default` / `fallback` | 默认模型、请求失败时的回退，必须是 `models` 中的代号。当前模型已是 fallback 时不再提示切换 |
-| `analyzer` | `{ type: "classifier" \| "chat", provider, id, timeoutMs }` |
-| `relationMinProb` | 分类器判断 relation 的最低置信度（0–1，缺省 0.6） |
+| `analyzer` | `{ type: "classifier" \| "chat", provider, id, timeoutMs }`，见下方说明 |
+| `relationMinProb` | 仅 `classifier`：判断 relation 的最低置信度（0–1，缺省 0.6） |
 | `contextWarn` | `{ tokens: number[], percent, userTurns }`，上下文过长提醒阈值 |
 | `roles` | 可选。`{ "<角色名>": { use?, hint? } }`，覆盖分派策略里的用途说明 |
 | `confirmTimeoutSec` | 分派确认框自动执行秒数；`0` 关闭 |
@@ -94,9 +94,39 @@ cp <REPO_DIR>/task-router.example.json ~/.pi/agent/task-router.json
 | `features` | `autoModel` / `relationCheck` / `confirm` / `contextWarn` / `handoffAutoClose`，均为布尔 |
 | `policyAppend` | 追加到分派规则末尾，不覆盖内置规则 |
 
-analyzer 不可用时：先用配置的 analyzer；失败则改用当前会话模型再分析一次；当前模型也失败或就是 analyzer 本身则返回空结果（首条落到 `default`，后续分流拿不准时当 `continuation`）。
-
 校验只读取已知字段；旧配置里多出来的键会被忽略，不会因此暂停路由。
+
+#### analyzer：`classifier` 与 `chat`
+
+`analyzer` 用来判断首条消息该用哪个模型、后续消息是续聊还是该分派。`provider` / `id` 必须在本机模型目录中存在且已配置凭据。
+
+**`"classifier"`**：走 pi 的 `classify` API，需要目录里有对应的分类器模型。示例（请改成你自己的分类器）：
+
+```json
+"analyzer": {
+  "type": "classifier",
+  "provider": "typesafe",
+  "id": "jev-latest",
+  "timeoutMs": 15000
+}
+```
+
+**`"chat"`**：把判断题发给普通聊天模型，要求它只输出 JSON。没有分类器时推荐这种方式，选你最便宜的聊天模型即可：
+
+```json
+"analyzer": {
+  "type": "chat",
+  "provider": "deepseek",
+  "id": "deepseek-flash",
+  "timeoutMs": 15000
+}
+```
+
+失败时的实际顺序：
+
+1. 先用配置的 analyzer（`classifier` 走 `classify`，`chat` 走该聊天模型）。
+2. 失败则提示警告，状态栏标明分析模型不可用，**改用当前会话模型、以 chat JSON 方式再分析一次**。
+3. 当前模型也失败，或当前模型就是 analyzer 本身（或当前还没有模型）：返回空结果。首条消息落到 `default`；后续分流拿不准时当 `continuation`。
 
 ### 4. 验证
 
@@ -111,6 +141,41 @@ command -v herdr   # 可选
 - `配置：` 后面是 `.../.pi/agent/task-router.json`，**不是**「已暂停（读取/校验失败）」
 - `分析模型：` 为你配置的 `provider/id`（若不可用会注明改用当前模型）
 - 列出已加载角色（`coder` / `verifier` / `chore` 等）
+
+### 卸载
+
+`<source>` 必须与 `pi list` 显示的第一行一致（本地路径安装常见为相对 `settings.json` 的路径，git 安装为 `git:github.com/<owner>/pi-task-router`）。
+
+```bash
+pi list | grep -A1 pi-task-router
+# 记下该包的 source 行，例如 ../../project/for-agents/pi-task-router
+pi remove <source>
+pi list | grep pi-task-router   # 应无输出
+```
+
+`pi remove` 会同时删掉 `~/.pi/agent/settings.json` 里的条目。本地路径安装不会删除仓库目录。
+
+然后只删除确认属于本包的角色文件（软链接指向 `<REPO_DIR>/agents/`，或内容与本仓库一致）。不要删用户自己写的同名角色：
+
+```bash
+for f in coder verifier chore session; do
+  p="$HOME/.pi/agent/agents/${f}.md"
+  echo "== ${p} =="
+  if [ -L "$p" ]; then readlink "$p"; elif [ -e "$p" ]; then echo "regular file, inspect before delete"; else echo "missing"; fi
+done
+# 确认无误后再删，例如软链接指向本仓库时：
+# rm ~/.pi/agent/agents/coder.md ~/.pi/agent/agents/verifier.md ~/.pi/agent/agents/chore.md ~/.pi/agent/agents/session.md
+ls ~/.pi/agent/agents
+```
+
+可选：
+
+```bash
+rm ~/.pi/agent/task-router.json          # 个人配置
+# rm -rf <REPO_DIR>                      # 克隆下来的仓库
+ls ~/.pi/agent/task-router.json          # 可选删除后应不存在
+pi list | grep pi-task-router            # 仍应无输出
+```
 
 ## 项目结构
 
