@@ -110,12 +110,17 @@ function loadAgentsFromDir(dir: string): AgentConfig[] {
 
 		const { frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content);
 
-		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") {
+		if (typeof frontmatter.description !== "string") {
+			continue;
+		}
+		const name =
+			(typeof frontmatter.name === "string" && frontmatter.name) || entry.name.replace(/\.md$/, "");
+		if (!name) {
 			continue;
 		}
 
 		agents.push({
-			name: frontmatter.name,
+			name,
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
@@ -129,7 +134,7 @@ function loadAgentsFromDir(dir: string): AgentConfig[] {
 	return agents;
 }
 
-/** Load roles from `~/.pi/agent/agents`. Duplicate names: later file wins. */
+/** Load roles from `getAgentDir()/agents`. Duplicate names: later file wins. */
 export function discoverAgents(): AgentConfig[] {
 	const userDir = path.join(getAgentDir(), "agents");
 	const agentMap = new Map<string, AgentConfig>();

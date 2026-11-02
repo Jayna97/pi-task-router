@@ -1,7 +1,7 @@
 /**
  * task-router — 会话级模型选择 + 分派策略（执行层由 pi-herdr-subagents 负责）
  *
- * - 配置：只读 ~/.pi/agent/task-router.json；读取或校验失败时暂停自动路由（不注入分派策略、不自动选模型/分流），session_start 提示错误
+ * - 配置：只读 pi 配置目录（getAgentDir()）下的 task-router.json；读取或校验失败时暂停自动路由（不注入分派策略、不自动选模型/分流），session_start 提示错误
  * - 会话首条消息：判断任务 → 选模型，本会话固定（启动时带 --model、子代理窗口、手动 /model 过的会话不判断）
  * - 分析模型见配置 analyzer（type classifier|chat；不可用时改用当前模型）
  * - 后续消息：判断是否为子任务/独立任务 → 交给当前 agent 写提示词并调用 subagent 分派
@@ -12,7 +12,7 @@
  * - /route [status|handoff|new|off|on|confirm on|confirm off]（status 含确认超时秒数）
  * - 前缀：@代号 指定首条消息模型（代号见配置 models）；>> 强制当作新窗口任务
  *
- * 角色定义：只从 ~/.pi/agent/agents/*.md 读取（除 session 与 dispatch: false 外均可分派）
+ * 角色定义：只从 pi 配置目录（getAgentDir()）下的 agents/*.md 读取（除 session 与 dispatch: false 外均可分派）
  * features：autoModel / relationCheck / confirm / contextWarn / handoffAutoClose（默认全开）
  * policyAppend：追加到分派规则末尾（不覆盖）
  */
@@ -22,10 +22,10 @@ import { existsSync, readdirSync, readFileSync, statSync, type Dirent } from "no
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Type } from "typebox";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ───────────────────────── 配置 ─────────────────────────
-// 只读 ~/.pi/agent/task-router.json，不做内置默认深合并。代号限 [a-z][a-z0-9_-]*
+// 只读 pi 配置目录（getAgentDir()）下的 task-router.json，不做内置默认深合并。代号限 [a-z][a-z0-9_-]*
 // confirmTimeoutSec：分派确认框首次弹出后的自动执行秒数（缺省 30；0 关闭；Esc 仍拦截）
 // roles：{ "<name>": { use?, hint? } }；缺省用角色 description / frontmatter model
 // features：autoModel / relationCheck / confirm / contextWarn / handoffAutoClose
@@ -57,11 +57,11 @@ interface RouterConfig {
 
 const FEATURE_KEYS: FeatureKey[] = ["autoModel", "relationCheck", "confirm", "contextWarn", "handoffAutoClose"];
 
-const CONFIG_PATH = join(homedir(), ".pi/agent/task-router.json");
-const CLOSE_LOG_PATH = join(homedir(), ".pi/agent/task-router-close.log");
-const HANDOFF_DIR = join(homedir(), ".pi/agent/handoff");
+const CONFIG_PATH = join(getAgentDir(), "task-router.json");
+const CLOSE_LOG_PATH = join(getAgentDir(), "task-router-close.log");
+const HANDOFF_DIR = join(getAgentDir(), "handoff");
 const PICK_NAME_RE = /^[a-z][a-z0-9_-]*$/;
-const AGENTS_DIR = join(homedir(), ".pi/agent/agents");
+const AGENTS_DIR = join(getAgentDir(), "agents");
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -540,7 +540,7 @@ function buildPolicy(herdr: boolean): string {
 		? "本会话固定使用一个模型，一个会话只做一件主题任务，保持上下文短而干净。可用模型："
 		: "本会话固定使用一个模型，一个会话只做一件主题任务。当前不在 herdr 中，无法开新窗口；session 交接与 /route handoff、/route new 不可用。可用模型：";
 	const sessionHandoffNote = SESSION_WINDOW
-		? '\n- 本窗口是 session，不能再用 subagent(agent:"session")。无关新任务同样写到 ~/.pi/agent/handoff/<名称>-<日期时间>.md 再调用 handoff_open，结果不回传。'
+		? `\n- 本窗口是 session，不能再用 subagent(agent:"session")。无关新任务同样写到 ${HANDOFF_DIR}/<名称>-<日期时间>.md 再调用 handoff_open，结果不回传。`
 		: "";
 	const tools = herdr
 		? `按角色选择工具：
@@ -549,7 +549,7 @@ ${
 					? `窗口内同步执行（工具 subagent_inline，结果直接返回；多个窗口内子任务用 tasks 模式一次性提交）：\n${INLINE_ROLE_LINES}\n`
 					: ""
 			}开新窗口异步执行（工具 subagent，结果会自动回到本会话，不要轮询或等待）：
-${WINDOW_ROLE_LINES ? `${WINDOW_ROLE_LINES}\n` : ""}- 交接当前任务：把自包含说明写到 ~/.pi/agent/handoff/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。交接默认沿用当前模型。
+${WINDOW_ROLE_LINES ? `${WINDOW_ROLE_LINES}\n` : ""}- 交接当前任务：把自包含说明写到 ${HANDOFF_DIR}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。交接默认沿用当前模型。
 - 与主题无关的新任务 → agent: "session"，按任务难度显式传 model 和 thinking。/route new 始终开新窗口，不能用 subagent_inline。${sessionHandoffNote}`
 		: `用 subagent_inline 在当前窗口后台同步执行可独立完成的工作（结果直接返回；多个子任务用 tasks 模式一次性提交）：
 ${DISPATCH_ROLE_LINES}`;
@@ -773,10 +773,10 @@ export default function (pi: ExtensionAPI) {
 			name: "handoff_open",
 			label: "交接开窗",
 			description:
-				"读取 ~/.pi/agent/handoff/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 PI_SUBAGENT_* / PI_INLINE_*，不受子代理监视、不回传）。参数：file、model（provider/id）、thinking。",
-			promptSnippet: "把交接说明写到 ~/.pi/agent/handoff/<名称>-<日期时间>.md 后调用，开新 tab 接手。",
+				`读取 ${HANDOFF_DIR}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 PI_SUBAGENT_* / PI_INLINE_*，不受子代理监视、不回传）。参数：file、model（provider/id）、thinking。`,
+			promptSnippet: `把交接说明写到 ${HANDOFF_DIR}/<名称>-<日期时间>.md 后调用，开新 tab 接手。`,
 			parameters: Type.Object({
-				file: Type.String({ description: "交接文件路径，必须在 ~/.pi/agent/handoff/ 下" }),
+				file: Type.String({ description: `交接文件路径，必须在 ${HANDOFF_DIR}/ 下` }),
 				model: Type.String({ description: "新会话模型，provider/id" }),
 				thinking: Type.String({ description: "思考等级，如 low|medium|high" }),
 			}),
@@ -916,7 +916,7 @@ export default function (pi: ExtensionAPI) {
 		const sug = suggestion ? `路由建议模型：${suggestion}；可根据上下文调整。` : "";
 		const how =
 			IN_HERDR && SESSION_WINDOW && kind !== "子任务"
-				? `写到 ~/.pi/agent/handoff/<名称>-<日期时间>.md（含「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。${sug}`
+				? `写到 ${HANDOFF_DIR}/<名称>-<日期时间>.md（含「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。${sug}`
 				: IN_HERDR && kind !== "子任务"
 					? `调用 subagent（agent: "session"）开新窗口，按任务难度显式传 model 和 thinking。${sug}`
 				: IN_HERDR
@@ -1112,7 +1112,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (choice === "执行") return;
 				if (choice === undefined && timedOut) {
-					ctx.ui.notify(isInline ? "确认超时，已自动在窗口内执行" : "确认超时，已自动开新窗口执行", "info");
+					ctx.ui.notify(isInline ? "未在限时内选择，已按默认在窗口内执行" : "未在限时内选择，已按默认开新窗口执行", "info");
 					return;
 				}
 				return { block: true, reason: "用户取消了这次分派。不要重试，询问用户希望如何处理。" };
@@ -1198,7 +1198,7 @@ export default function (pi: ExtensionAPI) {
 						handoffOpened = false;
 					}
 					pi.sendUserMessage(
-						`[task-router] 把当前任务交接到新窗口。写一份自包含的交接说明到 ~/.pi/agent/handoff/<名称>-<日期时间>.md：目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」（告诉新会话先做什么）；丢弃已过时或无关的内容。${
+						`[task-router] 把当前任务交接到新窗口。写一份自包含的交接说明到 ${HANDOFF_DIR}/<名称>-<日期时间>.md：目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」（告诉新会话先做什么）；丢弃已过时或无关的内容。${
 							IN_HERDR
 								? `然后调用 handoff_open（file: 该文件路径，model: "${current}"，thinking: "${ctx.thinkingLevel ?? "medium"}"，除非剩余工作明显更适合其他模型）。`
 								: "然后把提示词完整输出给用户，建议用户在新会话中继续。"

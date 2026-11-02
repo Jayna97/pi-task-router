@@ -1,202 +1,157 @@
 # pi-task-router
 
-会话级选模型与分派策略，以及当前窗口内同步执行的 `subagent_inline`。
+[pi coding agent](https://github.com/earendil-works/pi) 扩展包：会话级选模型、子任务分派策略，以及在当前窗口内同步执行子代理的 `subagent_inline` 工具。
 
 ## 主要功能
 
-- 读 `~/.pi/agent/task-router.json`：会话首条消息选模型（之后本会话固定），后续消息判断子任务 / 无关新任务并分流。
-- 分派前确认；上下文过长提醒交接；任意模型请求失败且当前不是 fallback 时，提示切到 fallback。
-- 角色只从 `~/.pi/agent/agents/*.md` 读取（支持软链接）。`session` 与 `dispatch: false` 不分派。
-- 注册 `subagent_inline`：当前窗口另起 `pi` 子进程同步执行，不开新 herdr 窗口。
-- 不在 herdr 中时：可分派角色全部改为窗口内执行；`session` 交接与 `/route handoff`、`/route new` 不可用。
-- 命令：`/route [status|handoff|new|off|on|confirm on|confirm off]`。前缀 `@代号` 指定首条消息模型；`>>` 强制当作新窗口任务。
+- **会话选模型**：会话首条消息由分析模型判断任务难度，从配置的模型列表中选一个，之后本会话固定使用。消息前缀 `@代号` 可手动指定；启动时带 `--model` 或已用 `/model` 切换过的会话不自动选。
+- **后续消息分流**：判断新消息是续聊、子任务还是无关新任务；后两者经确认后由当前 agent 写提示词并分派。消息前缀 `>>` 强制作为新窗口任务。
+- **分派前确认**：拦截 `subagent` / `subagent_inline` 调用，可执行、查看或编辑任务、换模型、取消；超时自动执行（可关闭）。
+- **`subagent_inline`**：在当前窗口另起 `pi` 子进程同步执行角色任务，结果直接作为工具返回值，不开新窗口。
+- **角色**：从 `~/.pi/agent/agents/*.md` 读取。本包自带 `coder`（编码）、`verifier`（验证）、`chore`（杂务）、`session`（新窗口独立会话）。`session` 和 frontmatter 中 `dispatch: false` 的角色不参与分派。
+
+## 命令
+
+```text
+/route [status|handoff [说明]|new <任务>|off|on|confirm on|confirm off]
+```
+
+`/route status` 显示当前配置、分析模型和各角色的执行方式，配置有问题时也会在这里给出警告。
 
 ## 快速开始
 
-### 前置依赖
+### 依赖
 
-| 依赖 | 必需 | 检查 | 缺失时 |
-|---|---|---|---|
-| [pi coding agent](https://github.com/badlogic/pi-mono) | 是 | `pi --version` | `curl -fsSL https://pi.dev/install.sh \| sh`，或 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`（需 Node.js 22.19+） |
-| [pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents) | 开新窗口分派 `subagent` 时必需 | `pi list \| grep pi-herdr-subagents` | `pi install npm:pi-herdr-subagents` |
-| herdr | 否。不在 herdr 中时全部走 `subagent_inline` | `command -v herdr` | 参见其官方文档 |
+- [pi](https://github.com/earendil-works/pi)，必需。
+- [herdr](https://herdr.dev)，可选。开新窗口分派、`session` 角色和交接到新窗口都需要在 herdr 中运行 pi。
+- [pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents)，提供开新窗口分派的 `subagent` 工具，在 herdr 中使用时需要：`pi install npm:pi-herdr-subagents`。
 
-### 需要你提供的值
+不使用 herdr 时的行为见下文[不在 herdr 中运行时](#不在-herdr-中运行时)。
 
-集中改这些占位符，不要散落替换：
+### 安装
 
-| 占位符 | 含义 |
+```bash
+pi install git:github.com/Jayna97/pi-task-router
+```
+
+包会被克隆到 pi 配置目录下的 `git/github.com/Jayna97/pi-task-router`。pi 配置目录默认是 `~/.pi/agent`，设置了 `PI_CODING_AGENT_DIR` 时跟随该变量（配置文件、角色、handoff 均在此目录下）。下文的 `~/.pi/agent/...` 均指该目录。不要再把扩展文件另外放进 `~/.pi/agent/extensions/`，否则会重复注册工具。
+
+### 用法一：直接用自带角色和示例配置
+
+1. 把包里 `agents/` 下的四个角色文件**复制**到 `~/.pi/agent/agents/`（已有同名文件时自行合并）。不要用软链接：`pi update` 会重置克隆目录，`pi remove` 会删除克隆目录。
+2. 把 `task-router.example.json` 复制为 `~/.pi/agent/task-router.json`。
+3. 把模型换成你有凭据的模型：配置中的 `models`、`analyzer`，以及 `coder.md`、`verifier.md`、`chore.md` frontmatter 中的 `model`（`provider/id`）。`session.md` 没有写模型，不需要改。
+
+### 用法二：用自己的角色
+
+角色就是角色目录下的 `.md` 文件，可以增删或改写，自带的四个只是示例。角色目录是 pi 配置目录下的 `agents/`，默认 `~/.pi/agent/agents/`，设置了 `PI_CODING_AGENT_DIR` 时随之改变。
+
+```markdown
+---
+name: reviewer
+description: 代码审查。只读代码、指出问题，不改文件，完成后汇报。
+model: openai/gpt-6.1-sol
+thinking: high
+tools: read, bash
+---
+
+你是代码审查者……（正文即该角色的系统提示词）
+```
+
+frontmatter 字段：
+
+| 字段 | 作用 |
 |---|---|
-| `<owner>` | GitHub 用户或组织名 |
-| `<REPO_URL>` | 本仓库 git 地址 |
-| `<REPO_DIR>` | 本机克隆路径（绝对路径） |
-| 各模型 `provider` / `id` | 写入 `task-router.json` 的 `models`，须在本机模型目录中存在且已配置凭据 |
-| `analyzer.provider` / `analyzer.id` | 分析模型（`classifier` 或 `chat`） |
+| `name` | 角色名。缺省时取文件名 |
+| `description` | 角色用途，会写进分派策略；`subagent_inline` 同样要求填写 |
+| `model` | 默认模型 `provider/id`；分派时可显式覆盖，缺省则继承调用方模型 |
+| `thinking` | 默认思考等级，规则同 `model` |
+| `tools` | 可用工具列表，`read, bash` 或 `[read, bash]` 均可；缺省不限制 |
+| `spawning` | 是否允许该角色继续分派。缺省时只有 `session` 允许 |
+| `dispatch` | `false` 表示不参与分派 |
 
-### 1. 安装本包
+`auto-exit`、`interactive`、`system-prompt` 等字段由 pi-herdr-subagents 读取，只对开新窗口执行生效。
 
-**自己的设备**（clone 到固定路径，按本地路径安装，之后可以直接改源码）：
+正文是该角色的系统提示词，窗口内执行时追加在 pi 默认系统提示词之后。
 
-```bash
-git clone <REPO_URL> <REPO_DIR>
-pi install <REPO_DIR>
-pi list
-```
+`session` 是唯一特殊的名字：它始终开新窗口，不参与分派，不能用 `subagent_inline` 调用；在 session 窗口中 `subagent_done` 会被拦截，由用户决定何时结束；缺省允许继续分派。其他角色（除 `dispatch: false`）都参与分派。
 
-`pi list` 应出现 `pi-task-router`，路径指向 `<REPO_DIR>`。
+`task-router.json` 中与角色相关的配置：
 
-`pi install` 会把本地路径写成相对于 `~/.pi/agent/settings.json` 的相对路径。多台设备共用同一份 `settings.json` 时，必须把仓库克隆到相同的绝对路径。
+- `roles.<名>.use` 覆盖策略中的用途说明（缺省用 `description`），`hint` 追加一句提示。
+- `dispatch.inlineRoles` 列出在 herdr 中也走窗口内执行的角色，其余可分派角色开新窗口。
 
-**其他人**：
+配置引用了不存在的角色时，该项会被忽略并给出警告。
 
-```bash
-pi install git:github.com/<owner>/pi-task-router
-pi list
-```
+### 配置字段
 
-不要同时把扩展放进 `~/.pi/agent/extensions/` 再 `pi install`，否则会重复加载、工具重复注册。
-
-### 2. 链接或复制角色文件
-
-本包的 `agents/*.md` **不会**随 `pi install` 自动生效。
-
-```bash
-mkdir -p ~/.pi/agent/agents
-for f in coder verifier chore session; do
-  ln -sfn "<REPO_DIR>/agents/${f}.md" ~/.pi/agent/agents/${f}.md
-done
-ls -l ~/.pi/agent/agents
-```
-
-应看到四个指向本仓库 `agents/` 的软链接。也可以 `cp <REPO_DIR>/agents/*.md ~/.pi/agent/agents/`。安装后按本机模型改各角色 frontmatter 的 `model`。
-
-### 3. 复制并修改配置
-
-```bash
-cp <REPO_DIR>/task-router.example.json ~/.pi/agent/task-router.json
-```
-
-打开 `~/.pi/agent/task-router.json`，把示例里的模型代号、`provider`/`id`、`default`/`fallback`、`analyzer` 改成你目录里真实存在的值。不要把填好个人路径或密钥的配置提交回本仓库。
-
-缺少配置、JSON 无效或校验失败时：**暂停自动路由**（不注入分派策略、不自动选模型/分流），并在 `session_start` 提示错误。
+配置文件为 `~/.pi/agent/task-router.json`，字段如下：
 
 | 字段 | 含义 |
 |---|---|
-| `models` | 代号 → `{ provider, id, desc }`。代号须匹配 `[a-z][a-z0-9_-]*` |
-| `default` / `fallback` | 默认模型、请求失败时的回退，必须是 `models` 中的代号。当前模型已是 fallback 时不再提示切换 |
-| `analyzer` | `{ type: "classifier" \| "chat", provider, id, timeoutMs }`，见下方说明 |
-| `relationMinProb` | 仅 `classifier`：判断 relation 的最低置信度（0–1，缺省 0.6） |
-| `contextWarn` | `{ tokens: number[], percent, userTurns }`，上下文过长提醒阈值 |
-| `roles` | 可选。`{ "<角色名>": { use?, hint? } }`，覆盖分派策略里的用途说明 |
-| `confirmTimeoutSec` | 分派确认框自动执行秒数；`0` 关闭 |
-| `dispatch.inlineRoles` | 走 `subagent_inline` 的角色名 |
-| `dispatch.inlineConfirmTimeoutSec` | 窗口内分派确认超时 |
-| `features` | `autoModel` / `relationCheck` / `confirm` / `contextWarn` / `handoffAutoClose`，均为布尔 |
-| `policyAppend` | 追加到分派规则末尾，不覆盖内置规则 |
+| `models` | 代号 → `{ provider, id, desc }`。`desc` 提供给分析模型作为选择依据 |
+| `default` | 自动选模型失败时使用的代号 |
+| `fallback` | 请求失败时提示切换到的代号 |
+| `analyzer` | 分析模型，见下文 |
+| `contextWarn` | `{ tokens: number[], percent, userTurns }`，任一达到即提醒交接 |
+| `roles` | 可选，覆盖分派策略中各角色的用途说明 |
+| `confirmTimeoutSec` | 新窗口分派确认的自动执行秒数，`0` 关闭 |
+| `dispatch.inlineRoles` | 在 herdr 中也走 `subagent_inline` 的角色 |
+| `dispatch.inlineConfirmTimeoutSec` | 窗口内分派确认的自动执行秒数，`0` 关闭 |
+| `features` | `autoModel`、`relationCheck`、`confirm`、`contextWarn`、`handoffAutoClose` 开关，均为布尔值 |
+| `policyAppend` | 可选，追加到分派规则末尾的文字 |
 
-校验只读取已知字段；旧配置里多出来的键会被忽略，不会因此暂停路由。
-
-#### analyzer：`classifier` 与 `chat`
-
-`analyzer` 用来判断首条消息该用哪个模型、后续消息是续聊还是该分派。`provider` / `id` 必须在本机模型目录中存在且已配置凭据。
-
-**`"classifier"`**：走 pi 的 `classify` API，需要目录里有对应的分类器模型。示例（请改成你自己的分类器）：
+`analyzer` 负责判断首条消息用哪个模型、后续消息与当前任务的关系，有两种类型：
 
 ```json
-"analyzer": {
-  "type": "classifier",
-  "provider": "typesafe",
-  "id": "jev-latest",
-  "timeoutMs": 15000
-}
+"analyzer": { "type": "classifier", "provider": "typesafe", "id": "jev-latest", "timeoutMs": 15000 }
 ```
-
-**`"chat"`**：把判断题发给普通聊天模型，要求它只输出 JSON。没有分类器时推荐这种方式，选你最便宜的聊天模型即可：
 
 ```json
-"analyzer": {
-  "type": "chat",
-  "provider": "deepseek",
-  "id": "deepseek-flash",
-  "timeoutMs": 15000
-}
+"analyzer": { "type": "chat", "provider": "<provider>", "id": "<便宜的聊天模型>", "timeoutMs": 15000 }
 ```
 
-失败时的实际顺序：
+`classifier` 调用 pi 的分类器模型（见 pi 文档 `docs/models.md` 的 “Use classifier models”），可配合 `relationMinProb`（缺省 0.6）设置分流的最低置信度；没有分类器时用 `chat`，选一个便宜的聊天模型即可。
 
-1. 先用配置的 analyzer（`classifier` 走 `classify`，`chat` 走该聊天模型）。
-2. 失败则提示警告，状态栏标明分析模型不可用，**改用当前会话模型、以 chat JSON 方式再分析一次**。
-3. 当前模型也失败，或当前模型就是 analyzer 本身（或当前还没有模型）：返回空结果。首条消息落到 `default`；后续分流拿不准时当 `continuation`。
+配置完成后启动 `pi`，用 `/route status` 确认配置已加载。
 
-### 4. 验证
+## 不在 herdr 中运行时
 
-```bash
-pi --version
-pi list | grep pi-task-router
-command -v herdr   # 可选
-```
+是否在 herdr 中，以环境变量 `HERDR_ENV=1` 且存在 `HERDR_PANE_ID` 判断。不在 herdr 中时：
 
-启动 pi（不要加 `--no-extensions`），执行 `/route status`。正常时：
+- **不可用**：开新窗口分派、`session` 角色、`handoff_open` 工具（不注册）、交接后自动关闭窗口。
+- **改变行为**：所有可分派角色都用 `subagent_inline` 窗口内执行，`dispatch.inlineRoles` 不再起作用；`/route new` 和 `>>` 的新任务也在窗口内执行；`/route handoff` 只生成交接提示词，由你在新会话中使用。
+- **不受影响**：选模型、分流、分派确认、请求失败切 fallback、上下文提醒。
 
-- `配置：` 后面是 `.../.pi/agent/task-router.json`，**不是**「已暂停（读取/校验失败）」
-- `分析模型：` 为你配置的 `provider/id`（若不可用会注明改用当前模型）
-- 列出已加载角色（`coder` / `verifier` / `chore` 等）
+在 herdr 中但没有安装 pi-herdr-subagents 时，`subagent` 工具不存在，开新窗口的角色和 `session` 都无法分派；`handoff_open` 和交接后自动关闭仍然可用。这种情况下把所有可分派角色写进 `dispatch.inlineRoles`。
 
-### 卸载
+## 更新与卸载
 
-`<source>` 必须与 `pi list` 显示的第一行一致（本地路径安装常见为相对 `settings.json` 的路径，git 安装为 `git:github.com/<owner>/pi-task-router`）。
-
-```bash
-pi list | grep -A1 pi-task-router
-# 记下该包的 source 行，例如 ../../project/for-agents/pi-task-router
-pi remove <source>
-pi list | grep pi-task-router   # 应无输出
-```
-
-`pi remove` 会同时删掉 `~/.pi/agent/settings.json` 里的条目。本地路径安装不会删除仓库目录。
-
-然后只删除确认属于本包的角色文件（软链接指向 `<REPO_DIR>/agents/`，或内容与本仓库一致）。不要删用户自己写的同名角色：
-
-```bash
-for f in coder verifier chore session; do
-  p="$HOME/.pi/agent/agents/${f}.md"
-  echo "== ${p} =="
-  if [ -L "$p" ]; then readlink "$p"; elif [ -e "$p" ]; then echo "regular file, inspect before delete"; else echo "missing"; fi
-done
-# 确认无误后再删，例如软链接指向本仓库时：
-# rm ~/.pi/agent/agents/coder.md ~/.pi/agent/agents/verifier.md ~/.pi/agent/agents/chore.md ~/.pi/agent/agents/session.md
-ls ~/.pi/agent/agents
-```
-
-可选：
-
-```bash
-rm ~/.pi/agent/task-router.json          # 个人配置
-# rm -rf <REPO_DIR>                      # 克隆下来的仓库
-ls ~/.pi/agent/task-router.json          # 可选删除后应不存在
-pi list | grep pi-task-router            # 仍应无输出
-```
+- 更新：`pi update git:github.com/Jayna97/pi-task-router`。只更新扩展代码，已复制的角色文件不会变，需要时自行对比合并。
+- 卸载：`pi remove git:github.com/Jayna97/pi-task-router`，再删除 `~/.pi/agent/agents/` 中属于本包的角色文件（注意不要误删自己写的同名角色），以及可选的 `~/.pi/agent/task-router.json`。
 
 ## 项目结构
 
 ```text
 pi-task-router/
-├── package.json                 # pi 包清单，声明两个扩展
-├── task-router.example.json     # 配置示例，复制到 ~/.pi/agent/task-router.json
+├── package.json               # pi 包清单，声明两个扩展
+├── task-router.example.json   # 配置示例
 ├── extensions/
-│   ├── task-router.ts           # 选模型、分流、确认、handoff、失败切 fallback
+│   ├── task-router.ts         # 选模型、分流、分派确认、交接、失败切 fallback
 │   └── inline-subagent/
-│       ├── index.ts             # 注册 subagent_inline
-│       └── agents.ts            # 从 ~/.pi/agent/agents 发现角色
-└── agents/
-    ├── coder.md                 # 编码执行者
-    ├── verifier.md              # 验证者
-    ├── chore.md                 # 杂务
-    └── session.md               # 新窗口独立会话（不分派）
+│       ├── index.ts           # subagent_inline 工具
+│       └── agents.ts          # 角色发现
+└── agents/                    # 角色文件，需复制到 ~/.pi/agent/agents/
+    ├── coder.md               # 编码
+    ├── verifier.md            # 验证
+    ├── chore.md               # 杂务
+    └── session.md             # 新窗口独立会话（不参与分派）
 ```
 
----
+## 说明
 
-task-router 在 herdr 里做 `/route handoff` 前，会读 pi-herdr-subagents 挂在 `globalThis[Symbol.for("pi-subagents/runtime")].runningSubagents` 上的 `Map`，统计本进程自己派生的未完成子窗口。读不到时按 0 处理，不拦截交接。这不是公开 API，升级后可能失效。
-
-个人项目，不做主要支持。
+- **请求失败切 fallback**：当前模型请求失败且不是 fallback 模型时，提示切换到 `fallback`。
+- **上下文过长提醒**：超过 `contextWarn` 阈值时提示用 `/route handoff` 写交接说明并在新窗口接手，每项每会话只提醒一次。
+- **配置无效时**：缺少配置文件、JSON 无效或校验失败时暂停自动路由（不选模型、不分流），启动时提示错误；分派确认仍生效，但不会超时自动执行。
+- **analyzer 失败时**：先改用当前会话模型以 chat 方式再判断一次；仍失败则首条消息使用 `default`，后续消息按续聊处理。
+- **统计未完成子窗口**：`/route handoff` 和上下文提醒前会读取 pi-herdr-subagents 的内部运行状态，统计本会话派生的未完成子窗口。这不是公开 API，读不到时按 0 处理，不拦截交接。
