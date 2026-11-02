@@ -1,6 +1,6 @@
 ---
 name: chore
-description: 杂务执行者。清理缓存、整理文件、跑命令、查资料、机械批量修改等小任务，短上下文快速完成后汇报并自动退出。默认 deepseek-flash。
+description: 杂务执行者。清理缓存、整理文件、跑命令、查资料、机械批量修改等小任务，短上下文快速完成后汇报并自动退出。默认模型见 frontmatter。
 model: deepseek/deepseek-flash
 thinking: low
 spawning: false

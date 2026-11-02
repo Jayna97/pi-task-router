@@ -8,22 +8,21 @@
 		"grok": {
 			"provider": "xai",
 			"id": "grok-4.6",
-			"desc": "默认主力，500K 上下文，可随便用。常规编码、修 bug、按明确计划实现、测试与验证"
+			"desc": "默认主力，500K 上下文。常规编码、修 bug、按明确计划实现、测试与验证"
 		},
 		"gpt": {
 			"provider": "openai",
 			"id": "gpt-6.1-sol",
-			"desc": "强推理，272K 上下文，高峰期不稳定。算法、复杂调试、代码审查、方案推敲"
+			"desc": "强推理，272K 上下文。算法、复杂调试、代码审查、方案推敲"
 		},
 		"opus": {
 			"provider": "anthropic",
 			"id": "claude-opus-5-5",
-			"desc": "最强，token 不充裕。架构设计与任务编排、跨模块重构、疑难问题。不要用它执行机械步骤"
+			"desc": "最强。架构设计与任务编排、跨模块重构、疑难问题。不要用它执行机械步骤"
 		}
 	},
 	"default": "grok",
 	"fallback": "grok",
-	"unstable": ["gpt"],
 	"analyzer": {
 		"type": "classifier",
 		"provider": "typesafe",

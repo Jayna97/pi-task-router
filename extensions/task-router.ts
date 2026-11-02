@@ -8,7 +8,7 @@
  * - 拦截 subagent / subagent_inline：确认 / 编辑任务 / 换模型 / 取消（超时自动执行，0 关闭）
  * - auto-exit 与 interactive 只对新窗口执行（subagent）生效；窗口内执行不读这两项
  * - 上下文过长：提醒 /route handoff 交接
- * - 配置 unstable 中的模型出错：提供切换到 fallback
+ * - 当前模型请求失败（stopReason 为 error）且不是 fallback 本身：提供切换到 fallback
  * - /route [status|handoff|new|off|on|confirm on|confirm off]（status 含确认超时秒数）
  * - 前缀：@代号 指定首条消息模型（代号见配置 models）；>> 强制当作新窗口任务
  *
@@ -42,7 +42,6 @@ interface RouterConfig {
 	models: Record<string, ModelSpec>;
 	default: string;
 	fallback: string;
-	unstable: string[];
 	analyzer: Analyzer;
 	relationMinProb: number;
 	contextWarn: { tokens: number[]; percent: number; userTurns: number };
@@ -203,9 +202,6 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 		throw new Error("contextWarn.tokens 必须是正数数组");
 	const percent = reqNum(raw.contextWarn.percent, "contextWarn.percent");
 	const userTurns = reqNum(raw.contextWarn.userTurns, "contextWarn.userTurns");
-	const unstable = raw.unstable == null ? [] : raw.unstable;
-	if (!Array.isArray(unstable) || unstable.some((x) => typeof x !== "string" || !(x in models)))
-		throw new Error("unstable 必须是 models 中的代号列表");
 	if (raw.roles != null && !isPlainObject(raw.roles)) throw new Error("roles 必须是对象");
 	const roles: Record<string, RoleMeta> = {};
 	const warnings: string[] = [];
@@ -262,7 +258,6 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 			models,
 			default: inModels("default", raw.default),
 			fallback: inModels("fallback", raw.fallback),
-			unstable: unstable as string[],
 			analyzer: {
 				type,
 				provider: reqStr(analyzerRaw.provider, "analyzer.provider"),
@@ -292,7 +287,6 @@ function pausedConfig(): RouterConfig {
 		models: {},
 		default: "",
 		fallback: "",
-		unstable: [],
 		analyzer: { type: "classifier", provider: "", id: "", timeoutMs: 15_000 },
 		relationMinProb: 0.6,
 		contextWarn: { tokens: [], percent: 100, userTurns: Number.MAX_SAFE_INTEGER },
@@ -339,7 +333,6 @@ const CONFIG_WARNING = LOADED.warning;
 const MODELS = CFG.models;
 const DEFAULT_PICK = CFG.default;
 const FALLBACK = CFG.fallback;
-const UNSTABLE = CFG.unstable;
 const ANALYZER = CFG.analyzer;
 const ANALYZER_TIMEOUT_MS = ANALYZER.timeoutMs;
 const RELATION_MIN_PROB = CFG.relationMinProb;
@@ -515,8 +508,6 @@ const CONTINUE_RE =
 function heuristicFirst(text: string): { model: Pick; thinking: Level; reason: string } | undefined {
 	const m = text.match(PREFIX_RE);
 	if (m) return { model: m[1].toLowerCase(), thinking: "medium", reason: "手动指定" };
-	if (isPick("flash") && text.length < 40 && /[?？]|是什么|什么是|怎么|如何|为什么|解释|翻译/.test(text))
-		return { model: "flash", thinking: "low", reason: "简短问答" };
 	return undefined;
 }
 
@@ -1133,7 +1124,7 @@ export default function (pi: ExtensionAPI) {
 		if (handoffPending && event.toolName === "handoff_open" && !event.isError) handoffOpened = true;
 	});
 
-	// 上下文过长提醒 + unstable 模型出错切换
+	// 上下文过长提醒 + 任意模型出错切 fallback（fallback 自身出错不弹）
 	pi.on("agent_settled", async (event, ctx) => {
 		const opened = handoffOpened;
 		handoffPending = false;
@@ -1150,24 +1141,26 @@ export default function (pi: ExtensionAPI) {
 		if (event.aborted || !ctx.hasUI || IS_WORKER) return;
 		const msgs = branchMessages(ctx);
 		const last = [...msgs].reverse().find((m) => m.role === "assistant");
+		const fallbackSpec = MODELS[FALLBACK];
 
-		const unstableHit =
-			last?.stopReason === "error" ? UNSTABLE.find((k) => MODELS[k]?.provider === last.provider && MODELS[k]?.id === last.model) : undefined;
-		if (unstableHit && last) {
-			const c = await ctx.ui.select(`⚠ ${MODELS[unstableHit].id} 请求失败：${(last.errorMessage ?? "").slice(0, 120)}`, [
-				`切换到 ${MODELS[FALLBACK].id} 继续本会话`,
-				"稍后手动重试",
-			]);
-			if (c?.startsWith("切换")) {
-				const switched = await applyModel(pi, ctx, FALLBACK, asLevel(ctx.thinkingLevel));
-				ctx.ui.notify(
-					switched
-						? `已切换到 ${MODELS[FALLBACK].id}，发送"继续"即可`
-						: `⚠ 切换到 ${MODELS[FALLBACK].id} 失败（无凭据？），保持当前模型`,
-					switched ? "info" : "warning",
-				);
+		if (last?.stopReason === "error" && fallbackSpec) {
+			const isFallback = last.provider === fallbackSpec.provider && last.model === fallbackSpec.id;
+			if (!isFallback) {
+				const c = await ctx.ui.select(`⚠ ${last.model} 请求失败：${(last.errorMessage ?? "").slice(0, 120)}`, [
+					`切换到 ${fallbackSpec.id} 继续本会话`,
+					"稍后手动重试",
+				]);
+				if (c?.startsWith("切换")) {
+					const switched = await applyModel(pi, ctx, FALLBACK, asLevel(ctx.thinkingLevel));
+					ctx.ui.notify(
+						switched
+							? `已切换到 ${fallbackSpec.id}，发送"继续"即可`
+							: `⚠ 切换到 ${fallbackSpec.id} 失败（无凭据？），保持当前模型`,
+						switched ? "info" : "warning",
+					);
+				}
+				return;
 			}
-			return;
 		}
 
 		if (!FEATURES.contextWarn) return;

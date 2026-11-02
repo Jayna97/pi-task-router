@@ -1,6 +1,6 @@
 ---
 name: verifier
-description: 验证者。按验收标准检查已完成的改动：运行测试/构建、核对行为与需求，只报告问题不改代码，完成后汇报并自动退出。默认 grok-4.6。
+description: 验证者。按验收标准检查已完成的改动：运行测试/构建、核对行为与需求，只报告问题不改代码，完成后汇报并自动退出。默认模型见 frontmatter。
 model: xai/grok-4.6
 thinking: medium
 spawning: false
