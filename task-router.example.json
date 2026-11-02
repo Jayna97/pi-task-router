@@ -1,0 +1,64 @@
+{
+	"models": {
+		"flash": {
+			"provider": "deepseek",
+			"id": "deepseek-flash",
+			"desc": "快且便宜，1M 上下文。问答、总结、小脚本、缓存清理/文件整理、机械批量修改、跑命令"
+		},
+		"grok": {
+			"provider": "xai",
+			"id": "grok-4.6",
+			"desc": "默认主力，500K 上下文，可随便用。常规编码、修 bug、按明确计划实现、测试与验证"
+		},
+		"gpt": {
+			"provider": "openai",
+			"id": "gpt-6.1-sol",
+			"desc": "强推理，272K 上下文，高峰期不稳定。算法、复杂调试、代码审查、方案推敲"
+		},
+		"opus": {
+			"provider": "anthropic",
+			"id": "claude-opus-5-5",
+			"desc": "最强，token 不充裕。架构设计与任务编排、跨模块重构、疑难问题。不要用它执行机械步骤"
+		}
+	},
+	"default": "grok",
+	"fallback": "grok",
+	"unstable": ["gpt"],
+	"analyzer": {
+		"type": "classifier",
+		"provider": "typesafe",
+		"id": "jev-latest",
+		"timeoutMs": 15000
+	},
+	"relationMinProb": 0.6,
+	"contextWarn": {
+		"tokens": [150000, 300000],
+		"percent": 60,
+		"userTurns": 20
+	},
+	"roles": {
+		"coder": {
+			"use": "编码（编排/计划完成后的实现、下一轮编码）",
+			"hint": "高难编码显式传 model"
+		},
+		"verifier": {
+			"use": "验证 / 测试 / 验收"
+		},
+		"chore": {
+			"use": "小杂务（清理缓存、整理文件、跑命令、机械批量修改）"
+		}
+	},
+	"confirmTimeoutSec": 30,
+	"dispatch": {
+		"inlineRoles": ["chore", "verifier"],
+		"inlineConfirmTimeoutSec": 10
+	},
+	"features": {
+		"autoModel": true,
+		"relationCheck": true,
+		"confirm": true,
+		"contextWarn": true,
+		"handoffAutoClose": true
+	},
+	"policyAppend": ""
+}

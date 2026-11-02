@@ -1,0 +1,21 @@
+{
+  "name": "pi-task-router",
+  "version": "0.1.0",
+  "description": "Pi coding agent package: session-level model routing and subagent dispatch policy, plus in-window subagent_inline.",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "type": "module",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/task-router.ts",
+      "./extensions/inline-subagent/index.ts"
+    ]
+  }
+}
