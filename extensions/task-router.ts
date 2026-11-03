@@ -778,6 +778,50 @@ function resolveHandoffFile(file: string): string {
 	return resolved;
 }
 
+function assertHandoffArg(value: string, label: string): void {
+	if (/[\r\n"&|<>^%]/.test(value)) throw new Error(`${label} 含非法字符`);
+}
+
+function paneHasAgent(paneId: string): boolean {
+	const agents = herdrJson(["agent", "list"])?.result?.agents;
+	return Array.isArray(agents) && agents.some((a: any) => a?.pane_id === paneId);
+}
+
+function waitForPaneAgent(paneId: string, timeoutMs: number): void {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (paneHasAgent(paneId)) return;
+		sleepSync(500);
+	}
+	throw new Error(`等待 pane ${paneId} 上的 agent 超时`);
+}
+
+/** Windows pane 多为 PowerShell；herdr `agent start --kind pi` 会 Start-Process 无扩展的 npm `pi` 脚本。 */
+function startHandoffPi(paneId: string, agent: string, model: string, thinking: string): void {
+	assertHandoffArg(model, "model");
+	assertHandoffArg(thinking, "thinking");
+	if (IS_WIN32) {
+		const cmd = [
+			"Get-ChildItem Env: | Where-Object { $_.Name -like 'PI_SUBAGENT_*' -or $_.Name -like 'PI_INLINE_*' } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }",
+			`pi.cmd --model ${model} --thinking ${thinking}`,
+		].join("; ");
+		sleepSync(1500);
+		execFileSync("herdr", ["pane", "run", paneId, cmd], { encoding: "utf8", timeout: 10_000 });
+		waitForPaneAgent(paneId, 60_000);
+		try {
+			herdrJson(["agent", "rename", paneId, agent]);
+		} catch {}
+		return;
+	}
+	execFileSync(
+		"herdr",
+		["pane", "run", paneId, 'for __v in $(env | awk -F= \'/^(PI_SUBAGENT_|PI_INLINE_)/{print $1}\'); do unset "$__v"; done'],
+		{ encoding: "utf8", timeout: 10_000 },
+	);
+	sleepSync(400);
+	herdrJson(["agent", "start", agent, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", "--model", model, "--thinking", thinking], 70_000);
+}
+
 function openHandoffSession(file: string, model: string, thinking: string, cwd: string): { tabId: string; paneId: string; agent: string } {
 	const ws = process.env.HERDR_WORKSPACE_ID;
 	if (!ws) throw new Error("找不到 HERDR_WORKSPACE_ID");
@@ -789,16 +833,7 @@ function openHandoffSession(file: string, model: string, thinking: string, cwd: 
 	if (typeof tabId !== "string" || typeof paneId !== "string") throw new Error("herdr tab create 未返回 tab/pane id");
 	const agent = `ho${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`.slice(0, 32);
 	try {
-		// Windows 上跳过：pane 的 shell 不确定（cmd / PowerShell / 用户配置），POSIX unset 片段无法可靠执行。
-		if (!IS_WIN32) {
-			execFileSync(
-				"herdr",
-				["pane", "run", paneId, 'for __v in $(env | awk -F= \'/^(PI_SUBAGENT_|PI_INLINE_)/{print $1}\'); do unset "$__v"; done'],
-				{ encoding: "utf8", timeout: 10_000 },
-			);
-		}
-		sleepSync(400);
-		herdrJson(["agent", "start", agent, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", "--model", model, "--thinking", thinking], 70_000);
+		startHandoffPi(paneId, agent, model, thinking);
 	} catch (e) {
 		try {
 			execFileSync("herdr", ["tab", "close", tabId], { encoding: "utf8", timeout: 10_000 });
@@ -806,7 +841,11 @@ function openHandoffSession(file: string, model: string, thinking: string, cwd: 
 		throw e;
 	}
 	try {
-		herdrJson(["agent", "prompt", agent, `读取交接文件 ${filePrompt} 并按其中「第一步」开始。`]);
+		try {
+			herdrJson(["agent", "prompt", agent, `读取交接文件 ${filePrompt} 并按其中「第一步」开始。`]);
+		} catch {
+			herdrJson(["agent", "prompt", paneId, `读取交接文件 ${filePrompt} 并按其中「第一步」开始。`]);
+		}
 	} catch (e: any) {
 		throw new Error(`新会话已启动（tab ${tabId}，pane ${paneId}），但发送交接指令失败，请在该窗口手动让它读取 ${filePrompt}：${e?.message ?? e}`);
 	}

@@ -1,6 +1,6 @@
 {
   "name": "pi-task-router",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi coding agent package: session-level model routing and subagent dispatch policy, plus in-window subagent_inline.",
   "keywords": ["pi-package"],
   "license": "MIT",
