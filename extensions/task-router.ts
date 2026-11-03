@@ -20,7 +20,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { Type } from "typebox";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -88,6 +88,8 @@ const FEATURE_KEYS: FeatureKey[] = ["autoModel", "relationCheck", "confirm", "co
 const CONFIG_PATH = join(getAgentDir(), "task-router.json");
 const CLOSE_LOG_PATH = join(getAgentDir(), "task-router-close.log");
 const HANDOFF_DIR = join(getAgentDir(), "handoff");
+/** 给人/模型看：正斜杠，避免 JSON 把 Windows 路径里的 \t 等当成转义。 */
+const HANDOFF_DIR_PROMPT = HANDOFF_DIR.replaceAll("\\", "/");
 const PICK_NAME_RE = /^[a-z][a-z0-9_-]*$/;
 const AGENTS_DIR = join(getAgentDir(), "agents");
 
@@ -628,7 +630,7 @@ function buildPolicy(herdr: boolean): string {
 		? "本会话固定使用一个模型，一个会话只做一件主题任务，保持上下文短而干净。可用模型："
 		: "本会话固定使用一个模型，一个会话只做一件主题任务。当前不在 herdr 中，无法开新窗口；session 交接与 /route handoff、/route new 不可用。可用模型：";
 	const sessionHandoffNote = SESSION_WINDOW
-		? `\n- 本窗口是 session，不能再用 subagent(agent:"session")。无关新任务同样写到 ${HANDOFF_DIR}/<名称>-<日期时间>.md 再调用 handoff_open，结果不回传。`
+		? `\n- 本窗口是 session，不能再用 subagent(agent:"session")。无关新任务同样写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md 再调用 handoff_open，结果不回传。`
 		: "";
 	const tools = herdr
 		? `按角色选择工具：
@@ -637,7 +639,7 @@ ${
 					? `窗口内同步执行（工具 subagent_inline，结果直接返回；多个窗口内子任务用 tasks 模式一次性提交）：\n${INLINE_ROLE_LINES}\n`
 					: ""
 			}开新窗口异步执行（工具 subagent，结果会自动回到本会话，不要轮询或等待）：
-${WINDOW_ROLE_LINES ? `${WINDOW_ROLE_LINES}\n` : ""}- 交接当前任务：把自包含说明写到 ${HANDOFF_DIR}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。交接默认沿用当前模型。
+${WINDOW_ROLE_LINES ? `${WINDOW_ROLE_LINES}\n` : ""}- 交接当前任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。交接默认沿用当前模型。
 - 与主题无关的新任务 → agent: "session"，按任务难度显式传 model 和 thinking。/route new 始终开新窗口，不能用 subagent_inline。${sessionHandoffNote}`
 		: `用 subagent_inline 在当前窗口后台同步执行可独立完成的工作（结果直接返回；多个子任务用 tasks 模式一次性提交）：
 ${DISPATCH_ROLE_LINES}`;
@@ -732,23 +734,54 @@ function herdrJson(args: string[], timeoutMs = 45_000): any {
 	}
 }
 
+function toPromptPath(p: string): string {
+	return p.replaceAll("\\", "/");
+}
+
+/** Git Bash / MSYS / Cygwin / WSL 盘符路径 → 原生 Windows 路径。`//` UNC 不转。 */
+function normalizeWindowsShellPath(filePath: string): string {
+	if (!filePath.startsWith("/") || filePath.startsWith("//") || filePath.includes("\\")) return filePath;
+	const match = filePath.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+	if (!match) return filePath;
+	const suffix = match[2]?.replaceAll("/", "\\");
+	return `${match[1].toUpperCase()}:\\${suffix ?? ""}`;
+}
+
+function expandHandoffTilde(filePath: string): string {
+	if (filePath === "~") return homedir();
+	if (filePath.startsWith("~/") || (IS_WIN32 && filePath.startsWith("~\\"))) {
+		return join(homedir(), filePath.slice(2));
+	}
+	return filePath;
+}
+
 function isPathInsideDir(root: string, file: string): boolean {
-	const rel = relative(root, file);
-	if (!rel || isAbsolute(rel)) return false;
-	return rel.split(/[/\\]/)[0] !== "..";
+	const norm = (p: string) => {
+		const s = p.replaceAll("\\", "/");
+		return IS_WIN32 ? s.toLowerCase() : s;
+	};
+	const r = norm(root);
+	const f = norm(file);
+	const prefix = r.endsWith("/") ? r : `${r}/`;
+	return f.startsWith(prefix) && f.length > prefix.length;
 }
 
 function resolveHandoffFile(file: string): string {
-	const resolved = resolve(file.startsWith("~/") ? join(homedir(), file.slice(2)) : file);
+	let input = file.trim();
+	if (IS_WIN32) input = normalizeWindowsShellPath(input);
+	input = expandHandoffTilde(input);
+	const noSep = !input.includes("/") && !input.includes("\\");
+	const resolved = resolve(noSep ? join(HANDOFF_DIR, basename(input)) : input);
 	const root = resolve(HANDOFF_DIR);
-	if (!isPathInsideDir(root, resolved)) throw new Error(`交接文件必须在 ${HANDOFF_DIR} 下`);
-	if (!existsSync(resolved) || !statSync(resolved).isFile()) throw new Error(`交接文件不存在：${resolved}`);
+	if (!isPathInsideDir(root, resolved)) throw new Error(`交接文件必须在 ${HANDOFF_DIR_PROMPT} 下`);
+	if (!existsSync(resolved) || !statSync(resolved).isFile()) throw new Error(`交接文件不存在：${toPromptPath(resolved)}`);
 	return resolved;
 }
 
 function openHandoffSession(file: string, model: string, thinking: string, cwd: string): { tabId: string; paneId: string; agent: string } {
 	const ws = process.env.HERDR_WORKSPACE_ID;
 	if (!ws) throw new Error("找不到 HERDR_WORKSPACE_ID");
+	const filePrompt = toPromptPath(file);
 	const stem = basename(file, ".md").replace(/[^\w.-]+/g, "-").slice(0, 40) || "handoff";
 	const created = herdrJson(["tab", "create", "--workspace", ws, "--cwd", cwd, "--label", `handoff: ${stem}`, "--focus"]);
 	const tabId = created?.result?.tab?.tab_id;
@@ -773,9 +806,9 @@ function openHandoffSession(file: string, model: string, thinking: string, cwd: 
 		throw e;
 	}
 	try {
-		herdrJson(["agent", "prompt", agent, `读取交接文件 ${file} 并按其中「第一步」开始。`]);
+		herdrJson(["agent", "prompt", agent, `读取交接文件 ${filePrompt} 并按其中「第一步」开始。`]);
 	} catch (e: any) {
-		throw new Error(`新会话已启动（tab ${tabId}，pane ${paneId}），但发送交接指令失败，请在该窗口手动让它读取 ${file}：${e?.message ?? e}`);
+		throw new Error(`新会话已启动（tab ${tabId}，pane ${paneId}），但发送交接指令失败，请在该窗口手动让它读取 ${filePrompt}：${e?.message ?? e}`);
 	}
 	return { tabId, paneId, agent };
 }
@@ -883,10 +916,10 @@ export default function (pi: ExtensionAPI) {
 			name: "handoff_open",
 			label: "交接开窗",
 			description:
-				`读取 ${HANDOFF_DIR}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 PI_SUBAGENT_* / PI_INLINE_*，不受子代理监视、不回传）。参数：file、model（provider/id）、thinking。`,
-			promptSnippet: `把交接说明写到 ${HANDOFF_DIR}/<名称>-<日期时间>.md 后调用，开新 tab 接手。`,
+				`读取 ${HANDOFF_DIR_PROMPT}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 PI_SUBAGENT_* / PI_INLINE_*，不受子代理监视、不回传）。参数：file、model（provider/id）、thinking。`,
+			promptSnippet: `把交接说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md 后调用，开新 tab 接手。`,
 			parameters: Type.Object({
-				file: Type.String({ description: `交接文件路径，必须在 ${HANDOFF_DIR}/ 下` }),
+				file: Type.String({ description: `交接文件路径，必须在 ${HANDOFF_DIR_PROMPT}/ 下` }),
 				model: Type.String({ description: "新会话模型，provider/id" }),
 				thinking: Type.String({ description: "思考等级，如 low|medium|high" }),
 			}),
@@ -1032,7 +1065,7 @@ export default function (pi: ExtensionAPI) {
 		const sug = suggestion ? `路由建议模型：${suggestion}；可根据上下文调整。` : "";
 		const how =
 			IN_HERDR && SESSION_WINDOW && kind !== "子任务"
-				? `写到 ${HANDOFF_DIR}/<名称>-<日期时间>.md（含「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。${sug}`
+				? `写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（含「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。${sug}`
 				: IN_HERDR && kind !== "子任务"
 					? `调用 subagent（agent: "session"）开新窗口，按任务难度显式传 model 和 thinking。${sug}`
 				: IN_HERDR
@@ -1314,7 +1347,7 @@ export default function (pi: ExtensionAPI) {
 						handoffOpened = false;
 					}
 					pi.sendUserMessage(
-						`[task-router] 把当前任务交接到新窗口。写一份自包含的交接说明到 ${HANDOFF_DIR}/<名称>-<日期时间>.md：目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」（告诉新会话先做什么）；丢弃已过时或无关的内容。${
+						`[task-router] 把当前任务交接到新窗口。写一份自包含的交接说明到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md：目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」（告诉新会话先做什么）；丢弃已过时或无关的内容。${
 							IN_HERDR
 								? `然后调用 handoff_open（file: 该文件路径，model: "${current}"，thinking: "${ctx.thinkingLevel ?? "medium"}"，除非剩余工作明显更适合其他模型）。`
 								: "然后把提示词完整输出给用户，建议用户在新会话中继续。"
