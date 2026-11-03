@@ -20,9 +20,37 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { Type } from "typebox";
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+/** 老版本可能没有 VERSION 导出；命名空间导入避免加载失败。 */
+const PI_VERSION: unknown = (piCodingAgent as { VERSION?: unknown }).VERSION;
+const MIN_PI_VERSION = "1.3.0";
+
+/** 解析 major.minor.patch，可带 prerelease / build；无法解析返回 undefined。 */
+function parsePiVersion(v: unknown): { major: number; minor: number; patch: number; prerelease: boolean } | undefined {
+	if (typeof v !== "string") return undefined;
+	const m = v.trim().match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
+	if (!m) return undefined;
+	return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]), prerelease: !!m[4] };
+}
+
+/** 语义版本比较：a < min 为 true。VERSION 缺失或无法解析时返回 false（不提示）。 */
+function isPiVersionBelow(version: unknown, min: string = MIN_PI_VERSION): boolean {
+	const a = parsePiVersion(version);
+	const b = parsePiVersion(min);
+	if (!a || !b) return false;
+	if (a.major !== b.major) return a.major < b.major;
+	if (a.minor !== b.minor) return a.minor < b.minor;
+	if (a.patch !== b.patch) return a.patch < b.patch;
+	return a.prerelease && !b.prerelease;
+}
+
+function sleepSync(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
 // ───────────────────────── 配置 ─────────────────────────
 // 只读 pi 配置目录（getAgentDir()）下的 task-router.json，不做内置默认深合并。代号限 [a-z][a-z0-9_-]*
@@ -353,6 +381,66 @@ const PICK_ALT = PICKS.join("|") || "_";
 const PREFIX_RE = PICKS.length > 0 ? new RegExp(`^@(${PICK_ALT})\\b`, "i") : /$^/;
 
 const IN_HERDR = process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID;
+const IS_WIN32 = process.platform === "win32";
+
+/** Windows 上用 where.exe 查 PATH 中是否有 bash。非 win32 不调用。 */
+function windowsBashOnPath(): boolean {
+	try {
+		execFileSync("where.exe", ["bash"], {
+			encoding: "utf8",
+			timeout: 5_000,
+			stdio: ["ignore", "pipe", "ignore"],
+			windowsHide: true,
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+const WIN_BASH_ON_PATH = IS_WIN32 && IN_HERDR ? windowsBashOnPath() : true;
+const PI_VERSION_BELOW_MIN = isPiVersionBelow(PI_VERSION);
+
+/**
+ * session_start 时查（extensions.md：工厂在加载期 registerTool，session_start 在全部扩展加载并 bindCore 之后）。
+ * 加载期调用 pi.getAllTools() 会抛 “runtime not initialized”。
+ */
+function hasSubagentTool(pi: ExtensionAPI): boolean {
+	try {
+		const getAll = pi.getAllTools;
+		if (typeof getAll !== "function") return false;
+		const tools = getAll.call(pi) as Array<string | { name?: string }>;
+		if (!Array.isArray(tools)) return false;
+		return tools.some((t) => (typeof t === "string" ? t : t?.name) === "subagent");
+	} catch {
+		return false;
+	}
+}
+
+function piVersionStatusLine(): string {
+	if (typeof PI_VERSION !== "string" || !parsePiVersion(PI_VERSION)) return "pi 版本：未知";
+	if (PI_VERSION_BELOW_MIN) return `pi 版本：${PI_VERSION}（低于 ${MIN_PI_VERSION}）`;
+	return `pi 版本：${PI_VERSION}`;
+}
+
+function collectRuntimeWarnings(pi: ExtensionAPI): string[] {
+	const out: string[] = [];
+	if (PI_VERSION_BELOW_MIN && typeof PI_VERSION === "string") {
+		out.push(`当前 pi 版本为 ${PI_VERSION}，本扩展需要 ≥ ${MIN_PI_VERSION}，请升级 pi。`);
+	}
+	if (IN_HERDR && !hasSubagentTool(pi)) {
+		out.push(
+			"开新窗口分派不可用：未找到 subagent 工具。请执行 pi install npm:pi-herdr-subagents，或把可分派角色写进 dispatch.inlineRoles。",
+		);
+	}
+	if (IN_HERDR && IS_WIN32 && !WIN_BASH_ON_PATH) {
+		out.push(
+			"pi-herdr-subagents 开新窗口需要 bash。请把 Git Bash 的 bin 目录（如 C:\\Program Files\\Git\\bin）加入 PATH。",
+		);
+	}
+	return out;
+}
+
 const SUBAGENT_ID = process.env.PI_SUBAGENT_ID; // pi-herdr-subagents 子窗口
 const SUBAGENT_ROLE = process.env.PI_SUBAGENT_AGENT ?? "";
 const SESSION_WINDOW = SUBAGENT_ROLE === "session";
@@ -644,10 +732,16 @@ function herdrJson(args: string[], timeoutMs = 45_000): any {
 	}
 }
 
+function isPathInsideDir(root: string, file: string): boolean {
+	const rel = relative(root, file);
+	if (!rel || isAbsolute(rel)) return false;
+	return rel.split(/[/\\]/)[0] !== "..";
+}
+
 function resolveHandoffFile(file: string): string {
 	const resolved = resolve(file.startsWith("~/") ? join(homedir(), file.slice(2)) : file);
 	const root = resolve(HANDOFF_DIR);
-	if (resolved !== root && !resolved.startsWith(root + "/")) throw new Error(`交接文件必须在 ${HANDOFF_DIR} 下`);
+	if (!isPathInsideDir(root, resolved)) throw new Error(`交接文件必须在 ${HANDOFF_DIR} 下`);
 	if (!existsSync(resolved) || !statSync(resolved).isFile()) throw new Error(`交接文件不存在：${resolved}`);
 	return resolved;
 }
@@ -662,12 +756,15 @@ function openHandoffSession(file: string, model: string, thinking: string, cwd: 
 	if (typeof tabId !== "string" || typeof paneId !== "string") throw new Error("herdr tab create 未返回 tab/pane id");
 	const agent = `ho${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`.slice(0, 32);
 	try {
-		execFileSync(
-			"herdr",
-			["pane", "run", paneId, 'for __v in $(env | awk -F= \'/^(PI_SUBAGENT_|PI_INLINE_)/{print $1}\'); do unset "$__v"; done'],
-			{ encoding: "utf8", timeout: 10_000 },
-		);
-		execFileSync("sleep", ["0.4"]);
+		// Windows 上跳过：pane 的 shell 不确定（cmd / PowerShell / 用户配置），POSIX unset 片段无法可靠执行。
+		if (!IS_WIN32) {
+			execFileSync(
+				"herdr",
+				["pane", "run", paneId, 'for __v in $(env | awk -F= \'/^(PI_SUBAGENT_|PI_INLINE_)/{print $1}\'); do unset "$__v"; done'],
+				{ encoding: "utf8", timeout: 10_000 },
+			);
+		}
+		sleepSync(400);
 		herdrJson(["agent", "start", agent, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", "--model", model, "--thinking", thinking], 70_000);
 	} catch (e) {
 		try {
@@ -683,31 +780,41 @@ function openHandoffSession(file: string, model: string, thinking: string, cwd: 
 	return { tabId, paneId, agent };
 }
 
-/** 等本进程真正退出后再关当前 pane；kill -0 最多等 60 秒，失败写入 CLOSE_LOG_PATH。 */
+/** 等本进程真正退出后再关当前 pane。各平台统一用 node -e，逻辑与原先 sh 相同：kill(pid,0) 最多 60 秒，再 herdr pane get/close，失败写入 CLOSE_LOG_PATH。 */
+const CLOSE_PANE_JS = [
+	'const { execFileSync } = require("node:child_process");',
+	'const { appendFileSync } = require("node:fs");',
+	'const args = process.argv.slice(1).filter((a) => a !== "-e" && a !== "--");',
+	'const pid = Number(args[0]);',
+	'const paneId = args[1];',
+	'const logPath = args[2];',
+	'if (!Number.isFinite(pid) || !paneId || !logPath) process.exit(0);',
+	'function stamp() {',
+	'\tconst d = new Date();',
+	'\tconst p = (n) => String(n).padStart(2, "0");',
+	'\treturn d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "T" + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());',
+	'}',
+	'function log(msg) { try { appendFileSync(logPath, stamp() + " " + msg + "\\n"); } catch {} }',
+	'function appendErr(e) {',
+	'\tconst err = e && e.stderr != null ? String(e.stderr) : "";',
+	'\tif (err) { try { appendFileSync(logPath, err.endsWith("\\n") ? err : err + "\\n"); } catch {} }',
+	'}',
+	'function alive() { try { process.kill(pid, 0); return true; } catch (e) { return !!(e && e.code === "EPERM"); } }',
+	'for (let i = 0; i < 600 && alive(); i++) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);',
+	'if (alive()) { log("timeout 60s waiting for pid " + pid + ", skip close pane " + paneId); process.exit(0); }',
+	'try { execFileSync("herdr", ["pane", "get", paneId], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "ignore", "pipe"] }); }',
+	'catch (e) { appendErr(e); log("pane " + paneId + " gone or unreadable, skip close"); process.exit(0); }',
+	'try { execFileSync("herdr", ["pane", "close", paneId], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "ignore", "pipe"] }); }',
+	'catch (e) { appendErr(e); log("herdr pane close failed for pane " + paneId); }',
+].join("\n");
+
 function closeCurrentHerdrPaneAfterExit(): void {
 	const paneId = process.env.HERDR_PANE_ID;
 	if (!paneId) return;
 	const child = spawn(
-		"sh",
-		[
-			"-c",
-			[
-				'log() { printf "%s %s\\n" "$(date "+%Y-%m-%dT%H:%M:%S")" "$*" >> "$3"; }',
-				'i=0',
-				'while kill -0 "$1" 2>/dev/null; do',
-				'\ti=$((i+1))',
-				'\tif [ "$i" -ge 600 ]; then log "timeout 60s waiting for pid $1, skip close pane $2"; exit 0; fi',
-				'\tsleep 0.1',
-				'done',
-				'if ! herdr pane get "$2" >/dev/null 2>>"$3"; then log "pane $2 gone or unreadable, skip close"; exit 0; fi',
-				'if ! herdr pane close "$2" >/dev/null 2>>"$3"; then log "herdr pane close failed for pane $2"; fi',
-			].join("\n"),
-			"herdr-close-pane",
-			String(process.pid),
-			paneId,
-			CLOSE_LOG_PATH,
-		],
-		{ detached: true, stdio: "ignore" },
+		process.execPath,
+		["-e", CLOSE_PANE_JS, "--", String(process.pid), paneId, CLOSE_LOG_PATH],
+		{ detached: true, stdio: "ignore", windowsHide: true },
 	);
 	child.unref();
 }
@@ -757,6 +864,9 @@ export {
 	countRunningSubagents,
 	matchingPick,
 	nextContextWarn,
+	isPiVersionBelow,
+	parsePiVersion,
+	MIN_PI_VERSION,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -797,9 +907,15 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
-		if (!CONFIG_WARNING) return;
-		if (ctx.hasUI) ctx.ui.notify(CONFIG_WARNING, ROUTING_PAUSED ? "error" : "warning");
-		else if (ROUTING_PAUSED) console.error(`[task-router] ${CONFIG_WARNING}`);
+		if (CONFIG_WARNING) {
+			if (ctx.hasUI) ctx.ui.notify(CONFIG_WARNING, ROUTING_PAUSED ? "error" : "warning");
+			else if (ROUTING_PAUSED) console.error(`[task-router] ${CONFIG_WARNING}`);
+		}
+		const runtimeWarnings = collectRuntimeWarnings(pi);
+		if (runtimeWarnings.length === 0) return;
+		const msg = runtimeWarnings.join("\n");
+		if (ctx.hasUI) ctx.ui.notify(msg, "warning");
+		else console.error(`[task-router] ${msg}`);
 	});
 
 	/** 先用分析模型；失败时改用当前会话模型并提示。都失败返回 undefined。 */
@@ -1241,6 +1357,13 @@ export default function (pi: ExtensionAPI) {
 							`分析模型：${ANALYZER_REF}${analyzerDown ? "（不可用，改用当前模型）" : ""}`,
 							`配置：${ROUTING_PAUSED ? "已暂停（读取/校验失败）" : CONFIG_PATH}`,
 							`新任务检测：${detectionOff ? "关" : "开"} ｜ 分派确认：${confirmOn ? "开" : "关"} ｜ herdr：${IN_HERDR ? "是" : "否"}`,
+							piVersionStatusLine(),
+							IN_HERDR
+								? `subagent 工具：${hasSubagentTool(pi) ? "有" : "无（开新窗口分派不可用）"}`
+								: "",
+							IN_HERDR && IS_WIN32
+								? `bash：${WIN_BASH_ON_PATH ? "PATH 中有" : "PATH 中无（开新窗口需要 Git Bash 的 bin）"}`
+								: "",
 							`确认超时：${CONFIRM_TIMEOUT_SEC === 0 ? "关" : `${CONFIRM_TIMEOUT_SEC} 秒`} ｜ 窗口内确认超时：${INLINE_CONFIRM_TIMEOUT_SEC === 0 ? "关" : `${INLINE_CONFIRM_TIMEOUT_SEC} 秒`}`,
 							...roleLines,
 							featureLine,

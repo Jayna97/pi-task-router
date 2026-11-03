@@ -16,15 +16,15 @@
 /route [status|handoff [说明]|new <任务>|off|on|confirm on|confirm off]
 ```
 
-`/route status` 显示当前配置、分析模型和各角色的执行方式，配置有问题时也会在这里给出警告。
+`/route status` 显示当前配置、分析模型和各角色的执行方式；配置问题以及启动检查结果也会列在这里。
 
 ## 快速开始
 
 ### 依赖
 
-- [pi](https://github.com/earendil-works/pi)，必需。
+- [pi](https://github.com/earendil-works/pi) ≥ 1.3.0，必需。
 - [herdr](https://herdr.dev)，可选。开新窗口分派、`session` 角色和交接到新窗口都需要在 herdr 中运行 pi。
-- [pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents)，提供开新窗口分派的 `subagent` 工具，在 herdr 中使用时需要：`pi install npm:pi-herdr-subagents`。
+- [pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents)，提供开新窗口分派的 `subagent` 工具；在 herdr 中开新窗口时需要：`pi install npm:pi-herdr-subagents`。Windows 上还需要 PATH 中有 bash，例如把 Git Bash 的 `bin` 目录加入 PATH。
 
 不使用 herdr 时的行为见下文[不在 herdr 中运行时](#不在-herdr-中运行时)。
 
@@ -33,6 +33,8 @@
 ```bash
 pi install git:github.com/Jayna97/pi-task-router
 ```
+
+安装时请检查 herdr 与 pi-herdr-subagents 是否已安装；缺失时告诉用户会失去哪些功能（见[不在 herdr 中运行时](#不在-herdr-中运行时)），并询问是否安装。
 
 包会被克隆到 pi 配置目录下的 `git/github.com/Jayna97/pi-task-router`。pi 配置目录默认是 `~/.pi/agent`，设置了 `PI_CODING_AGENT_DIR` 时跟随该变量（配置文件、角色、handoff 均在此目录下）。下文的 `~/.pi/agent/...` 均指该目录。不要再把扩展文件另外放进 `~/.pi/agent/extensions/`，否则会重复注册工具。
 
@@ -150,6 +152,7 @@ pi-task-router/
 
 ## 说明
 
+- **启动检查**：每个会话提示一次。pi 低于 1.3.0 时提示升级；在 herdr 中但没有 `subagent` 工具时，提示安装 pi-herdr-subagents 或把可分派角色写入 `dispatch.inlineRoles`；Windows 上在 herdr 中但 PATH 里没有 bash 时，提示加入 Git Bash 的 `bin` 目录。不在 herdr 中时不做 herdr 相关提示。`/route status` 会显示这些检查结果。
 - **请求失败切 fallback**：当前模型请求失败且不是 fallback 模型时，提示切换到 `fallback`。
 - **上下文过长提醒**：超过 `contextWarn` 阈值时提示用 `/route handoff` 写交接说明并在新窗口接手，每项每会话只提醒一次。
 - **配置无效时**：缺少配置文件、JSON 无效或校验失败时暂停自动路由（不选模型、不分流），启动时提示错误；分派确认仍生效，但不会超时自动执行。
