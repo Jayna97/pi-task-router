@@ -314,9 +314,11 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
+			const winCmd = process.platform === "win32" && /\.cmd$/i.test(invocation.command);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
-				shell: false,
+				shell: winCmd,
+				windowsHide: true,
 				stdio: ["ignore", "pipe", "pipe"],
 				env: childProcessEnv(agent),
 			});

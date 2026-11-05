@@ -518,6 +518,19 @@ function agentDefault(agent: string | undefined, field: "model" | "thinking"): s
 
 const WORKER_DENY_SPAWN = IS_WORKER;
 
+function modelSupportsReasoning(model: { reasoning?: boolean } | undefined): boolean {
+	return model?.reasoning === true;
+}
+
+/** 推理模型停在 off 时抬到 medium。中继缺 thinkingLevelMap 时，从非推理模型切过来会卡在 off。 */
+function ensureThinkingOn(pi: ExtensionAPI, ctx: ExtensionContext): void {
+	if (IS_WORKER) return;
+	if (!modelSupportsReasoning(ctx.model as { reasoning?: boolean } | undefined)) return;
+	const lv = ctx.thinkingLevel;
+	if (lv && lv !== "off") return;
+	pi.setThinkingLevel("medium");
+}
+
 async function applyModel(pi: ExtensionAPI, ctx: ExtensionContext, pick: Pick, level: Level): Promise<boolean> {
 	const spec = MODELS[pick];
 	if (!spec) return false;
@@ -979,6 +992,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		ensureThinkingOn(pi, ctx);
 		if (CONFIG_WARNING) {
 			if (ctx.hasUI) ctx.ui.notify(CONFIG_WARNING, ROUTING_PAUSED ? "error" : "warning");
 			else if (ROUTING_PAUSED) console.error(`[task-router] ${CONFIG_WARNING}`);
@@ -988,6 +1002,10 @@ export default function (pi: ExtensionAPI) {
 		const msg = runtimeWarnings.join("\n");
 		if (ctx.hasUI) ctx.ui.notify(msg, "warning");
 		else console.error(`[task-router] ${msg}`);
+	});
+
+	pi.on("model_select", (_event, ctx) => {
+		ensureThinkingOn(pi, ctx);
 	});
 
 	/** 先用分析模型；失败时改用当前会话模型并提示。都失败返回 undefined。 */
