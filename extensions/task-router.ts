@@ -835,12 +835,70 @@ function startHandoffPi(paneId: string, agent: string, model: string, thinking: 
 	herdrJson(["agent", "start", agent, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", "--model", model, "--thinking", thinking], 70_000);
 }
 
+function escapeRegExp(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** 去掉末尾一次 ` handoff[数字]`。纯 `handoff[数字]`（无基名）视为无原窗口名。 */
+function stripHandoffSuffix(label: string): string {
+	if (/^handoff\[\d+\]$/.test(label)) return "";
+	const m = label.match(/^(.*) handoff\[(\d+)\]$/);
+	return m ? m[1] : label;
+}
+
+function nextHandoffIndex(labels: unknown[], base: string | undefined): number {
+	const re = base ? new RegExp(`^${escapeRegExp(base)} handoff\\[(\\d+)\\]$`) : /^handoff\[(\d+)\]$/;
+	let max = 0;
+	for (const label of labels) {
+		if (typeof label !== "string") continue;
+		const m = label.match(re);
+		if (!m) continue;
+		const n = Number(m[1]);
+		if (Number.isInteger(n) && n > max) max = n;
+	}
+	return max + 1;
+}
+
+function nextHandoffTabLabel(): string {
+	try {
+		const ws = process.env.HERDR_WORKSPACE_ID;
+		if (!ws) return "handoff[1]";
+
+		let base: string | undefined;
+		const tabId = process.env.HERDR_TAB_ID;
+		if (tabId) {
+			try {
+				const got = herdrJson(["tab", "get", tabId]);
+				const label = got?.result?.tab?.label;
+				if (typeof label === "string" && label.length > 0) {
+					const stripped = stripHandoffSuffix(label);
+					if (stripped) base = stripped;
+				}
+			} catch {
+				// 取不到原窗口名：基名缺失，仍按 workspace 编号
+			}
+		}
+
+		let labels: unknown[] = [];
+		try {
+			const listed = herdrJson(["tab", "list", "--workspace", ws]);
+			const tabs = listed?.result?.tabs;
+			if (Array.isArray(tabs)) labels = tabs.map((t: any) => t?.label);
+		} catch {
+			return "handoff[1]";
+		}
+		const n = nextHandoffIndex(labels, base);
+		return base ? `${base} handoff[${n}]` : `handoff[${n}]`;
+	} catch {
+		return "handoff[1]";
+	}
+}
+
 function openHandoffSession(file: string, model: string, thinking: string, cwd: string): { tabId: string; paneId: string; agent: string } {
 	const ws = process.env.HERDR_WORKSPACE_ID;
 	if (!ws) throw new Error("找不到 HERDR_WORKSPACE_ID");
 	const filePrompt = toPromptPath(file);
-	const stem = basename(file, ".md").replace(/[^\w.-]+/g, "-").slice(0, 40) || "handoff";
-	const created = herdrJson(["tab", "create", "--workspace", ws, "--cwd", cwd, "--label", `handoff: ${stem}`, "--focus"]);
+	const created = herdrJson(["tab", "create", "--workspace", ws, "--cwd", cwd, "--label", nextHandoffTabLabel(), "--focus"]);
 	const tabId = created?.result?.tab?.tab_id;
 	const paneId = created?.result?.root_pane?.pane_id;
 	if (typeof tabId !== "string" || typeof paneId !== "string") throw new Error("herdr tab create 未返回 tab/pane id");
