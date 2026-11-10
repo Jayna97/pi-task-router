@@ -1200,6 +1200,8 @@ export default function (pi: ExtensionAPI) {
 		if (IS_WORKER || event.source !== "interactive" || event.streamingBehavior) return { action: "continue" };
 		let text = event.text.trim();
 		if (!text || text.startsWith("/") || text.startsWith("!")) return { action: "continue" };
+		// Read-only catalog queries are handled by the proxy audit extension, not task routing.
+		if (/^(?:请)?(?:帮我)?(?:更新中转站|查询模型|查询中转站模型)[。！!？?\s]*$/.test(text)) return { action: "continue" };
 
 		const msgs = branchMessages(ctx);
 		const hasUser = msgs.some((m) => m.role === "user");
