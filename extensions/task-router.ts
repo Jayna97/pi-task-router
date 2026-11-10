@@ -1,29 +1,29 @@
 /**
  * task-router — 会话级模型选择 + 分派策略（执行层由 pi-herdr-subagents 负责）
  *
- * - 配置：只读 pi 配置目录（getAgentDir()）下的 task-router.json；读取或校验失败时暂停自动路由（不注入分派策略、不自动选模型/分流），session_start 提示错误
- * - 会话首条消息：判断任务 → 选模型，本会话固定（启动时带 --model、子代理窗口、手动 /model 过的会话不判断）
- * - 分析模型见配置 analyzer（type classifier|chat；不可用时改用当前模型）
- * - 后续消息：判断是否为子任务/独立任务 → 交给当前 agent 写提示词并调用 subagent 分派
+ * - 配置：只读 pi 配置目录（getAgentDir()）下的 task-router.json；读取或校验失败时暂停自动路由（不注入分派策略），session_start 提示错误
+ * - 不自动选模型、不判断消息；只有用户主动用 >>、/route new 或在消息中明确要求时才分派
  * - 拦截 subagent / subagent_inline：确认 / 编辑任务 / 换模型 / 取消（超时自动执行，0 关闭）
  * - auto-exit 与 interactive 只对新窗口执行（subagent）生效；窗口内执行不读这两项
  * - 上下文过长：提醒 /route handoff 交接
  * - 当前模型请求失败（stopReason 为 error）且不是 fallback 本身：提供切换到 fallback
- * - /route [status|handoff|new|off|on|confirm on|confirm off]（status 含确认超时秒数）
- * - 前缀：@代号 指定首条消息模型（代号见配置 models）；>> 强制当作新窗口任务
+ * - /route [status|handoff|new|confirm on|confirm off]（status 含确认超时秒数）
+ * - 前缀：@代号 指定首条消息模型（代号见配置 models）；>> 强制当作新任务（herdr 开窗，否则窗口内）
  *
- * 角色定义：只从 pi 配置目录（getAgentDir()）下的 agents/*.md 读取（除 session 与 dispatch: false 外均可分派）
- * features：autoModel / relationCheck / confirm / contextWarn / handoffAutoClose（默认全开）
- * policyAppend：追加到分派规则末尾（不覆盖）
+ * 角色定义：由 inline-subagent/agents.ts 从 pi 配置目录下的 agents/*.md 读取；字段与含义沿用 pi-herdr-subagents（disable-model-invocation: true 的角色不列入分派策略；spawning: false 禁止继续分派）。task-router 不定义私有字段和特殊角色名。
+ * 无关新任务（>>、/route new）：herdr 中写任务说明并用 handoff_open 开普通会话；否则窗口内执行
+ * features：confirm / contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
+ * policyFile：行为规则 markdown（缺省 <agentDir>/task-router.policy.md）；policyAppend 追加到末尾
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Type } from "typebox";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { discoverAgents, shouldDenySpawning, type AgentConfig } from "./inline-subagent/agents.ts";
 
 /** 老版本可能没有 VERSION 导出；命名空间导入避免加载失败。 */
 const PI_VERSION: unknown = (piCodingAgent as { VERSION?: unknown }).VERSION;
@@ -55,25 +55,25 @@ function sleepSync(ms: number): void {
 // ───────────────────────── 配置 ─────────────────────────
 // 只读 pi 配置目录（getAgentDir()）下的 task-router.json，不做内置默认深合并。代号限 [a-z][a-z0-9_-]*
 // confirmTimeoutSec：分派确认框首次弹出后的自动执行秒数（缺省 30；0 关闭；Esc 仍拦截）
-// roles：{ "<name>": { use?, hint? } }；缺省用角色 description / frontmatter model
-// features：autoModel / relationCheck / confirm / contextWarn / handoffAutoClose
-// policyAppend：追加到分派规则末尾（不覆盖）
+// 角色说明只以角色文件为准（roles 已废弃，写了会被忽略并警告）
+// features：confirm / contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
+// policyFile：行为规则 markdown 路径（支持 ~）；policyAppend 追加到末尾（不覆盖）
 
 type Pick = string;
 type Level = "low" | "medium" | "high";
-type Analyzer = { type: "classifier" | "chat"; provider: string; id: string; timeoutMs: number };
 type ModelSpec = { provider: string; id: string; desc: string };
-type RoleMeta = { use?: string; hint?: string };
-type FeatureKey = "autoModel" | "relationCheck" | "confirm" | "contextWarn" | "handoffAutoClose";
+type FeatureKey =
+	| "confirm"
+	| "contextWarn"
+	| "handoffAutoClose"
+	| "windowSubagent"
+	| "inlineSubagent"
+	| "handoff";
 type Features = Record<FeatureKey, boolean>;
 interface RouterConfig {
 	models: Record<string, ModelSpec>;
-	default: string;
 	fallback: string;
-	analyzer: Analyzer;
-	relationMinProb: number;
 	contextWarn: { tokens: number[]; percent: number; userTurns: number };
-	roles: Record<string, RoleMeta>;
 	/** 分派确认框首次弹出后的自动执行秒数；0 关闭 */
 	confirmTimeoutSec: number;
 	/** 窗口内执行：哪些角色走 subagent_inline，以及其确认超时 */
@@ -81,9 +81,21 @@ interface RouterConfig {
 	features: Features;
 	/** 追加到分派规则末尾 */
 	policyAppend: string;
+	/** 行为规则 markdown 路径 */
+	policyFile: string;
 }
 
-const FEATURE_KEYS: FeatureKey[] = ["autoModel", "relationCheck", "confirm", "contextWarn", "handoffAutoClose"];
+const FEATURE_KEYS: FeatureKey[] = [
+	"confirm",
+	"contextWarn",
+	"handoffAutoClose",
+	"windowSubagent",
+	"inlineSubagent",
+	"handoff",
+];
+const DEFAULT_POLICY_PATH = join(getAgentDir(), "task-router.policy.md");
+/** 子代理通用约定（固定路径，缺失时写入内置默认） */
+const WORKER_POLICY_PATH = join(getAgentDir(), "task-router.worker.md");
 
 const CONFIG_PATH = join(getAgentDir(), "task-router.json");
 const CLOSE_LOG_PATH = join(getAgentDir(), "task-router-close.log");
@@ -117,91 +129,32 @@ function reqBool(v: unknown, label: string): boolean {
 	return v;
 }
 
-function fmValue(fm: string, key: string): string | undefined {
-	const raw = fm.match(new RegExp(`^${key}:\\s*(.+)$`, "m"))?.[1].trim();
-	if (!raw) return undefined;
-	if (
-		raw.length >= 2 &&
-		((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'")))
-	)
-		return raw.slice(1, -1);
-	return raw;
+function optBool(v: unknown, fallback: boolean, label: string): boolean {
+	if (v == null) return fallback;
+	return reqBool(v, label);
 }
 
-function parseOptionalBoolean(value: string | undefined): boolean | undefined {
-	if (value === "true") return true;
-	if (value === "false") return false;
-	return undefined;
-}
-
-interface AgentInfo {
-	name: string;
-	description: string;
-	model?: string;
-	thinking?: string;
-	spawning?: boolean;
-	dispatch: boolean;
-	filePath: string;
-}
-
-function loadAgents(): { agents: AgentInfo[]; warnings: string[] } {
-	const warnings: string[] = [];
-	const byName = new Map<string, AgentInfo>();
-	if (!existsSync(AGENTS_DIR)) {
-		warnings.push(`角色目录不存在：${AGENTS_DIR}`);
-		return { agents: [], warnings };
+function expandUserPath(p: string): string {
+	if (p === "~") return homedir();
+	if (p.startsWith("~/") || (process.platform === "win32" && p.startsWith("~\\"))) {
+		return join(homedir(), p.slice(2));
 	}
-	let entries: Dirent[];
+	return p;
+}
+
+/** 角色读取与 inline-subagent 共用一份实现（inline-subagent/agents.ts） */
+function loadAgents(): { agents: AgentConfig[]; warnings: string[] } {
+	if (!existsSync(AGENTS_DIR)) return { agents: [], warnings: [`角色目录不存在：${AGENTS_DIR}`] };
 	try {
-		entries = readdirSync(AGENTS_DIR, { withFileTypes: true });
+		return { agents: discoverAgents(), warnings: [] };
 	} catch (e: any) {
-		warnings.push(`读取角色目录失败（${String(e?.message ?? e).slice(0, 120)}）`);
-		return { agents: [], warnings };
+		return { agents: [], warnings: [`读取角色目录失败（${String(e?.message ?? e).slice(0, 120)}）`] };
 	}
-	const files = entries
-		.filter((e) => e.name.endsWith(".md") && (e.isFile() || e.isSymbolicLink()))
-		.sort((a, b) => a.name.localeCompare(b.name));
-	for (const entry of files) {
-		const filePath = join(AGENTS_DIR, entry.name);
-		let content: string;
-		try {
-			content = readFileSync(filePath, "utf8");
-		} catch (e: any) {
-			warnings.push(`读取角色文件失败：${entry.name}（${String(e?.message ?? e).slice(0, 80)}），已跳过`);
-			continue;
-		}
-		try {
-			const fm = content.match(/^---\n([\s\S]*?)\n---/)?.[1];
-			if (!fm) {
-				warnings.push(`角色文件无 frontmatter：${entry.name}，已跳过`);
-				continue;
-			}
-			const name = fmValue(fm, "name") || entry.name.replace(/\.md$/, "");
-			if (!name) {
-				warnings.push(`角色文件无名：${entry.name}，已跳过`);
-				continue;
-			}
-			const info: AgentInfo = {
-				name,
-				description: fmValue(fm, "description") ?? "",
-				model: fmValue(fm, "model"),
-				thinking: fmValue(fm, "thinking"),
-				spawning: parseOptionalBoolean(fmValue(fm, "spawning")),
-				dispatch: parseOptionalBoolean(fmValue(fm, "dispatch")) !== false,
-				filePath,
-			};
-			if (byName.has(name)) warnings.push(`角色名重复「${name}」（${entry.name}），后者覆盖前者`);
-			byName.set(name, info);
-		} catch (e: any) {
-			warnings.push(`解析角色文件失败：${entry.name}（${String(e?.message ?? e).slice(0, 80)}），已跳过`);
-		}
-	}
-	return { agents: [...byName.values()], warnings };
 }
 
 const AGENT_LOAD = loadAgents();
 const AGENT_BY_NAME = new Map(AGENT_LOAD.agents.map((a) => [a.name, a]));
-const DISPATCHABLE_ROLES = AGENT_LOAD.agents.filter((a) => a.name !== "session" && a.dispatch).map((a) => a.name);
+const DISPATCHABLE_ROLES = AGENT_LOAD.agents.filter((a) => !a.disableModelInvocation).map((a) => a.name);
 const DISPATCHABLE_SET = new Set(DISPATCHABLE_ROLES);
 
 function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] } {
@@ -218,37 +171,14 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 		if (!(s in models)) throw new Error(`${name} 必须是 models 中的代号`);
 		return s;
 	};
-	const analyzerRaw = raw.analyzer;
-	if (!isPlainObject(analyzerRaw)) throw new Error("analyzer 必须是对象");
-	const type = analyzerRaw.type;
-	if (type !== "classifier" && type !== "chat") throw new Error('analyzer.type 必须是 "classifier" 或 "chat"');
-	const timeoutMs = optNum(analyzerRaw.timeoutMs, 15_000, "analyzer.timeoutMs");
-	if (timeoutMs <= 0) throw new Error("analyzer.timeoutMs 必须 > 0");
-	const relationMinProb = optNum(raw.relationMinProb, 0.6, "relationMinProb");
-	if (relationMinProb < 0 || relationMinProb > 1) throw new Error("relationMinProb 必须在 0–1");
 	if (!isPlainObject(raw.contextWarn)) throw new Error("contextWarn 必须是对象");
 	const tokens = raw.contextWarn.tokens;
 	if (!Array.isArray(tokens) || tokens.length === 0 || tokens.some((t) => typeof t !== "number" || !Number.isFinite(t) || t <= 0))
 		throw new Error("contextWarn.tokens 必须是正数数组");
 	const percent = reqNum(raw.contextWarn.percent, "contextWarn.percent");
 	const userTurns = reqNum(raw.contextWarn.userTurns, "contextWarn.userTurns");
-	if (raw.roles != null && !isPlainObject(raw.roles)) throw new Error("roles 必须是对象");
-	const roles: Record<string, RoleMeta> = {};
 	const warnings: string[] = [];
-	for (const [k, v] of Object.entries(isPlainObject(raw.roles) ? raw.roles : {})) {
-		if (!isPlainObject(v)) {
-			warnings.push(`roles.${k} 格式无效，已忽略`);
-			continue;
-		}
-		if (!AGENT_BY_NAME.has(k)) {
-			warnings.push(`roles.${k} 对应角色不存在，已忽略`);
-			continue;
-		}
-		const meta: RoleMeta = {};
-		if (typeof v.use === "string" && v.use.trim()) meta.use = v.use.trim();
-		if (typeof v.hint === "string" && v.hint.trim()) meta.hint = v.hint.trim();
-		roles[k] = meta;
-	}
+	if (raw.roles != null) warnings.push("roles 已废弃（角色说明以角色文件为准），已忽略");
 	const confirmTimeoutSec = optNum(raw.confirmTimeoutSec, 30, "confirmTimeoutSec");
 	if (confirmTimeoutSec < 0) throw new Error("confirmTimeoutSec 必须是非负数（0 关闭自动执行）");
 	if (!isPlainObject(raw.dispatch)) throw new Error("dispatch 必须是对象");
@@ -257,16 +187,12 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 		throw new Error("dispatch.inlineRoles 必须是字符串数组");
 	const inlineRoles: string[] = [];
 	for (const r of inlineRolesRaw) {
-		if (r === "session") {
-			warnings.push("dispatch.inlineRoles 含 session，已忽略（session 始终开新窗口）");
-			continue;
-		}
 		const agent = AGENT_BY_NAME.get(r);
 		if (!agent) {
 			warnings.push(`dispatch.inlineRoles 含未知角色「${r}」，已忽略`);
 			continue;
 		}
-		if (!agent.dispatch || !DISPATCHABLE_SET.has(r)) {
+		if (!DISPATCHABLE_SET.has(r)) {
 			warnings.push(`dispatch.inlineRoles 含不可分派角色「${r}」，已忽略`);
 			continue;
 		}
@@ -280,27 +206,22 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 	if (inlineConfirmTimeoutSec < 0) throw new Error("dispatch.inlineConfirmTimeoutSec 必须是非负数（0 关闭自动执行）");
 	if (!isPlainObject(raw.features)) throw new Error("features 必须是对象");
 	const features = {} as Features;
-	for (const k of FEATURE_KEYS) features[k] = reqBool(raw.features[k], `features.${k}`);
+	for (const k of FEATURE_KEYS) features[k] = optBool(raw.features[k], true, `features.${k}`);
 	if (raw.policyAppend != null && typeof raw.policyAppend !== "string") throw new Error("policyAppend 必须是字符串");
 	const policyAppend = typeof raw.policyAppend === "string" ? raw.policyAppend : "";
+	if (raw.policyFile != null && typeof raw.policyFile !== "string") throw new Error("policyFile 必须是字符串");
+	const policyFileRaw = typeof raw.policyFile === "string" ? raw.policyFile.trim() : "";
+	const policyFile = resolve(expandUserPath(policyFileRaw || DEFAULT_POLICY_PATH));
 	return {
 		cfg: {
 			models,
-			default: inModels("default", raw.default),
 			fallback: inModels("fallback", raw.fallback),
-			analyzer: {
-				type,
-				provider: reqStr(analyzerRaw.provider, "analyzer.provider"),
-				id: reqStr(analyzerRaw.id, "analyzer.id"),
-				timeoutMs,
-			},
-			relationMinProb,
 			contextWarn: { tokens: tokens as number[], percent, userTurns },
-			roles,
 			confirmTimeoutSec,
 			dispatch: { inlineRoles, inlineConfirmTimeoutSec },
 			features,
 			policyAppend,
+			policyFile,
 		},
 		warnings,
 	};
@@ -315,16 +236,20 @@ function joinWarnings(...parts: Array<string | undefined>): string | undefined {
 function pausedConfig(): RouterConfig {
 	return {
 		models: {},
-		default: "",
 		fallback: "",
-		analyzer: { type: "classifier", provider: "", id: "", timeoutMs: 15_000 },
-		relationMinProb: 0.6,
 		contextWarn: { tokens: [], percent: 100, userTurns: Number.MAX_SAFE_INTEGER },
-		roles: {},
 		confirmTimeoutSec: 0,
 		dispatch: { inlineRoles: [], inlineConfirmTimeoutSec: 0 },
-		features: { autoModel: false, relationCheck: false, confirm: true, contextWarn: false, handoffAutoClose: false },
+		features: {
+			confirm: true,
+			contextWarn: false,
+			handoffAutoClose: false,
+			windowSubagent: true,
+			inlineSubagent: true,
+			handoff: true,
+		},
 		policyAppend: "",
+		policyFile: DEFAULT_POLICY_PATH,
 	};
 }
 
@@ -333,7 +258,7 @@ function loadConfig(): { cfg: RouterConfig; paused: boolean; warning?: string } 
 	const pause = (msg: string) => ({
 		cfg: pausedConfig(),
 		paused: true,
-		warning: joinWarnings(`${msg}。已暂停自动路由（不注入分派策略、不自动选模型/分流）`, agentWarn),
+		warning: joinWarnings(`${msg}。已暂停自动路由（不注入分派策略）`, agentWarn),
 	});
 	if (!existsSync(CONFIG_PATH)) return pause(`${CONFIG_PATH} 不存在`);
 	let text: string;
@@ -361,15 +286,10 @@ const CFG = LOADED.cfg;
 const ROUTING_PAUSED = LOADED.paused;
 const CONFIG_WARNING = LOADED.warning;
 const MODELS = CFG.models;
-const DEFAULT_PICK = CFG.default;
 const FALLBACK = CFG.fallback;
-const ANALYZER = CFG.analyzer;
-const ANALYZER_TIMEOUT_MS = ANALYZER.timeoutMs;
-const RELATION_MIN_PROB = CFG.relationMinProb;
 const CONTEXT_WARN_TOKENS = CFG.contextWarn.tokens;
 const CONTEXT_WARN_PERCENT = CFG.contextWarn.percent;
 const USER_TURN_WARN = CFG.contextWarn.userTurns;
-const ROLES = CFG.roles;
 const CONFIRM_TIMEOUT_SEC = CFG.confirmTimeoutSec;
 const INLINE_ROLES = CFG.dispatch.inlineRoles;
 const INLINE_CONFIRM_TIMEOUT_SEC = CFG.dispatch.inlineConfirmTimeoutSec;
@@ -378,6 +298,7 @@ const DISPATCH_ROLES = DISPATCHABLE_ROLES;
 const WINDOW_ROLES = DISPATCH_ROLES.filter((r) => !INLINE_ROLE_SET.has(r));
 const FEATURES = CFG.features;
 const POLICY_APPEND = CFG.policyAppend.trim();
+const POLICY_FILE = CFG.policyFile;
 const PICKS = Object.keys(MODELS);
 const PICK_ALT = PICKS.join("|") || "_";
 const PREFIX_RE = PICKS.length > 0 ? new RegExp(`^@(${PICK_ALT})\\b`, "i") : /$^/;
@@ -430,12 +351,12 @@ function collectRuntimeWarnings(pi: ExtensionAPI): string[] {
 	if (PI_VERSION_BELOW_MIN && typeof PI_VERSION === "string") {
 		out.push(`当前 pi 版本为 ${PI_VERSION}，本扩展需要 ≥ ${MIN_PI_VERSION}，请升级 pi。`);
 	}
-	if (IN_HERDR && !hasSubagentTool(pi)) {
+	if (IN_HERDR && FEATURES.windowSubagent && !hasSubagentTool(pi)) {
 		out.push(
 			"开新窗口分派不可用：未找到 subagent 工具。请执行 pi install npm:pi-herdr-subagents，或把可分派角色写进 dispatch.inlineRoles。",
 		);
 	}
-	if (IN_HERDR && IS_WIN32 && !WIN_BASH_ON_PATH) {
+	if (IN_HERDR && FEATURES.windowSubagent && IS_WIN32 && !WIN_BASH_ON_PATH) {
 		out.push(
 			"pi-herdr-subagents 开新窗口需要 bash。请把 Git Bash 的 bin 目录（如 C:\\Program Files\\Git\\bin）加入 PATH。",
 		);
@@ -445,17 +366,14 @@ function collectRuntimeWarnings(pi: ExtensionAPI): string[] {
 
 const SUBAGENT_ID = process.env.PI_SUBAGENT_ID; // pi-herdr-subagents 子窗口
 const SUBAGENT_ROLE = process.env.PI_SUBAGENT_AGENT ?? "";
-const SESSION_WINDOW = SUBAGENT_ROLE === "session";
 const INLINE_SUBAGENT = process.env.PI_INLINE_SUBAGENT === "1";
 const INLINE_AGENT = process.env.PI_INLINE_SUBAGENT_AGENT ?? "";
 const CURRENT_AGENT = INLINE_SUBAGENT ? INLINE_AGENT : SUBAGENT_ROLE;
-/** 子代理且 spawning:false（或未声明且不是 session）：不选模型、不注入分派规则、不能继续分派、不检测新任务、不弹确认、不提醒上下文 */
+/** 子代理且 spawning:false：不选模型、不注入分派规则、不能继续分派、不检测新任务、不弹确认、不提醒上下文 */
 function computeIsWorker(): boolean {
 	if (!INLINE_SUBAGENT && !SUBAGENT_ID) return false;
-	const spawning = AGENT_BY_NAME.get(CURRENT_AGENT)?.spawning;
-	if (spawning === false) return true;
-	if (spawning === undefined && CURRENT_AGENT !== "session") return true;
-	return false;
+	const agent = AGENT_BY_NAME.get(CURRENT_AGENT);
+	return agent ? shouldDenySpawning(agent) : false;
 }
 const IS_WORKER = computeIsWorker();
 const EXPLICIT_MODEL = process.argv.some((a) => a === "--model" || a.startsWith("--model="));
@@ -473,12 +391,6 @@ const SPAWN_TOOL_NAMES = new Set([
 const ref = (p: Pick) => `${MODELS[p].provider}/${MODELS[p].id}`;
 const modelTable = (Object.keys(MODELS) as Pick[]).map((k) => `- ${ref(k)}（${k}）：${MODELS[k].desc}`).join("\n");
 
-function textOf(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content.flatMap((b: any) => (b?.type === "text" ? [b.text] : [])).join("\n");
-}
-
 function branchMessages(ctx: ExtensionContext): any[] {
 	return ctx.sessionManager
 		.getBranch()
@@ -493,27 +405,11 @@ function routerEntry(ctx: ExtensionContext): any | undefined {
 		.at(-1)?.data;
 }
 
-function parseJson(text: string): any | undefined {
-	const m = text.match(/\{[\s\S]*\}/);
-	if (!m) return undefined;
-	try {
-		return JSON.parse(m[0]);
-	} catch {
-		return undefined;
-	}
-}
-
-const isPick = (v: unknown): v is Pick => typeof v === "string" && v in MODELS;
 const asLevel = (v: unknown, d: Level = "medium"): Level => (v === "low" || v === "medium" || v === "high" ? v : d);
 
 function agentDefault(agent: string | undefined, field: "model" | "thinking"): string | undefined {
 	if (!agent) return undefined;
-	const loaded = AGENT_BY_NAME.get(agent)?.[field];
-	if (loaded) return loaded;
-	const file = join(AGENTS_DIR, `${agent}.md`);
-	if (!existsSync(file)) return undefined;
-	const fm = readFileSync(file, "utf8").match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "";
-	return fmValue(fm, field);
+	return AGENT_BY_NAME.get(agent)?.[field];
 }
 
 const WORKER_DENY_SPAWN = IS_WORKER;
@@ -541,74 +437,9 @@ async function applyModel(pi: ExtensionAPI, ctx: ExtensionContext, pick: Pick, l
 	return ok;
 }
 
-// ───────────────────────── 分析 ─────────────────────────
+type DispatchMode = "inline" | "handoff";
 
-type Relation = "continuation" | "subtask" | "independent";
-interface FirstResult { model: Pick; thinking: Level; scenario?: string; difficulty?: string; reason: string }
-interface NextResult { relation: Relation; model?: Pick; thinking?: Level; reason: string }
-
-const ANALYZER_REF = `${ANALYZER.provider}/${ANALYZER.id}`;
-const DIFFICULTY_LEVEL: Record<string, Level> = { easy: "low", medium: "medium", hard: "high" };
-const MODEL_CRITERIA = Object.fromEntries((Object.keys(MODELS) as Pick[]).map((k) => [k, MODELS[k].desc]));
-const DIFFICULTY_CRITERIA = {
-	easy: "简单：问答、小脚本、机械修改、跑命令",
-	medium: "中等：常规功能、修 bug、按计划实现",
-	hard: "困难：架构设计、跨模块重构、疑难调试、复杂算法",
-};
-async function chatJson(ctx: ExtensionContext, model: any, system: string, user: string): Promise<any> {
-	const res = await ctx.modelRegistry.complete(
-		model,
-		{ systemPrompt: system, messages: [{ role: "user", content: [{ type: "text", text: user }], timestamp: Date.now() }] },
-		{ signal: AbortSignal.timeout(ANALYZER_TIMEOUT_MS * 2), cacheRetention: "none" } as any,
-	);
-	if (res.stopReason === "error" || res.stopReason === "aborted") throw new Error(res.errorMessage ?? res.stopReason);
-	const j = parseJson(textOf(res.content));
-	if (!j) throw new Error("输出不是 JSON");
-	return j;
-}
-
-async function classifyAnswers(ctx: ExtensionContext, state: Record<string, unknown>, questions: Record<string, any>) {
-	const m = ctx.modelRegistry.findOfType("classifier", ANALYZER.provider, ANALYZER.id);
-	if (!m) throw new Error("模型不在目录中或未配置凭据");
-	const r = await ctx.modelRegistry.classify(m, { state, questions }, { signal: AbortSignal.timeout(ANALYZER_TIMEOUT_MS) } as any);
-	if (r.stopReason !== "stop") throw new Error(r.errorMessage ?? r.stopReason);
-	return r.answers as Record<string, any>;
-}
-
-const pct = (a: any) => `${Math.round((a?.probabilities?.[a.choice] ?? 0) * 100)}%`;
-
-function normalizeFirst(j: any): FirstResult | undefined {
-	if (!j || !isPick(j.model)) return undefined;
-	return { model: j.model, thinking: asLevel(j.thinking), scenario: j.scenario, difficulty: j.difficulty, reason: j.reason ?? "" };
-}
-
-function normalizeNext(j: any): NextResult | undefined {
-	if (!j) return undefined;
-	const relation: Relation = j.relation === "subtask" || j.relation === "independent" ? j.relation : "continuation";
-	return { relation, model: isPick(j.model) ? j.model : undefined, thinking: asLevel(j.thinking), reason: j.reason ?? "" };
-}
-
-// ───────────────────────── 判断提示 ─────────────────────────
-
-const FIRST_SYSTEM = `你是任务路由器。根据用户在一个新 coding agent 会话中的第一条任务，选择最合适的模型。本会话之后会一直使用该模型。
-可选模型（括号内为代号）：
-${modelTable}
-原则：能用便宜模型完成就不用贵的；最强/最贵的模型只给真正高难的设计/编排/疑难任务。
-只输出 JSON：{"model":"${PICK_ALT}","thinking":"low|medium|high","scenario":"简短场景","difficulty":"easy|medium|hard","reason":"一句话理由"}`;
-
-const NEXT_SYSTEM = `你是任务路由器。一个 coding agent 会话有一个主题任务。判断用户的新消息与该主题的关系：
-- continuation：主题任务的推进、追问、修正、讨论、规划，适合留在本会话
-- subtask：主题任务下可以独立执行的一段工作（编排/计划完成后的编码、验证、测试，一轮新的编码，清理缓存等小杂务），适合开新窗口用短上下文执行
-- independent：与主题无关的新任务
-可选模型（括号内为代号）：
-${modelTable}
-如果不是 continuation，再为它推荐模型。拿不准时选 continuation。
-只输出 JSON：{"relation":"continuation|subtask|independent","model":"${PICK_ALT}","thinking":"low|medium|high","reason":"一句话理由"}`;
-
-const CONTINUE_RE =
-	/^(继续|好|好的|ok|可以|行|嗯|是的?|对|不|不用|算了|重试|再试|go|yes|no|y|n)\b|刚才|上面|前面|这个|那个|这里|那里|这段|那段|接着|再(改|加|跑|试|看|检查)|为什么|怎么回事|报错|错误|失败/i;
-
-function heuristicFirst(text: string): { model: Pick; thinking: Level; reason: string } | undefined {
+function parseModelPrefix(text: string): { model: Pick; thinking: Level; reason: string } | undefined {
 	const m = text.match(PREFIX_RE);
 	if (m) return { model: m[1].toLowerCase(), thinking: "medium", reason: "手动指定" };
 	return undefined;
@@ -618,10 +449,8 @@ function heuristicFirst(text: string): { model: Pick; thinking: Level; reason: s
 
 function roleLine(r: string): string {
 	const agent = AGENT_BY_NAME.get(r);
-	const meta = ROLES[r] ?? {};
-	const use = meta.use || agent?.description || r;
-	const extras = [agent?.model ? `默认 ${agent.model}` : undefined, meta.hint].filter(Boolean);
-	const suffix = extras.length ? `（${extras.join("；")}）` : "";
+	const use = agent?.description || r;
+	const suffix = agent?.model ? `（默认 ${agent.model}）` : "";
 	return `${use} → agent: "${r}"${suffix}`;
 }
 
@@ -629,60 +458,172 @@ const INLINE_ROLE_LINES = INLINE_ROLES.map((r) => `- ${roleLine(r)}`).join("\n")
 const WINDOW_ROLE_LINES = WINDOW_ROLES.map((r) => `- ${roleLine(r)}`).join("\n");
 const DISPATCH_ROLE_LINES = DISPATCH_ROLES.map((r) => `- ${roleLine(r)}`).join("\n");
 
-const POLICY_TASK_SELF_CONTAINED =
-	"- task 必须自包含（子代理看不到本会话）：背景、相关文件、已定决策、具体任务、验收标准、汇报要点；不要带入无关内容。";
-const POLICY_MODEL_ID = "- model 用完整的 provider/id。";
-const POLICY_DISPATCH_RULES = `规则：
-- 当主题任务进入可独立执行的阶段，或出现无关任务、小杂务时，分派出去，不要在本会话中执行。
-- 收到子任务汇报后，在本会话中做判断和下一步编排。`;
-const POLICY_COST =
-	'- 请用户在方案间做选择时，凡会引入新机制、明显增加代码量或依赖第三方内部实现的选项，附一句代价说明（"选 X 需要额外实现 Y，风险是 Z"）。';
+const DEFAULT_BEHAVIOR_POLICY = `# 行为规则
 
-function buildPolicy(herdr: boolean): string {
-	const header = herdr
-		? "本会话固定使用一个模型，一个会话只做一件主题任务，保持上下文短而干净。可用模型："
-		: "本会话固定使用一个模型，一个会话只做一件主题任务。当前不在 herdr 中，无法开新窗口；session 交接与 /route handoff、/route new 不可用。可用模型：";
-	const sessionHandoffNote = SESSION_WINDOW
-		? `\n- 本窗口是 session，不能再用 subagent(agent:"session")。无关新任务同样写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md 再调用 handoff_open，结果不回传。`
-		: "";
-	const tools = herdr
-		? `按角色选择工具：
-${
-				INLINE_ROLES.length
-					? `窗口内同步执行（工具 subagent_inline，结果直接返回；多个窗口内子任务用 tasks 模式一次性提交）：\n${INLINE_ROLE_LINES}\n`
-					: ""
-			}开新窗口异步执行（工具 subagent，结果会自动回到本会话，不要轮询或等待）：
-${WINDOW_ROLE_LINES ? `${WINDOW_ROLE_LINES}\n` : ""}- 交接当前任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。交接默认沿用当前模型。
-- 与主题无关的新任务 → agent: "session"，按任务难度显式传 model 和 thinking。/route new 始终开新窗口，不能用 subagent_inline。${sessionHandoffNote}`
-		: `用 subagent_inline 在当前窗口后台同步执行可独立完成的工作（结果直接返回；多个子任务用 tasks 模式一次性提交）：
-${DISPATCH_ROLE_LINES}`;
-	const extra = herdr
-		? `${POLICY_TASK_SELF_CONTAINED}
-${POLICY_MODEL_ID}
-
-${POLICY_DISPATCH_RULES.replace(
-				"不要在本会话中执行。",
-				"不要在本会话中执行；不要把多个阶段或多个任务都塞进本会话。",
-			)}
+- 默认在本会话完成所有工作，包括编码、验证、小杂务；不要主动调用 subagent、subagent_inline、handoff_open。
+- 只有用户在消息中明确要求时才使用子代理或交接，例如「开子代理」「派给某个角色」「让某个角色验一下」「交接」「开新窗口」，或用户使用了 \`>>\`、\`/route new\`、\`/route handoff\`。
+- 若某步适合拆出去（独立审查、测试设计、输出量大只需结论的排查、无关新任务、上下文过长），可以一句话建议，由用户决定，不要自己调用。
+- task 必须自包含（子代理看不到本会话）：背景、相关文件、已定决策、具体任务、验收标准、汇报要点；不要带入无关内容。
+- model 用完整的 provider/id。
 - 多个新窗口子任务并行时，收到部分结果只做一句简短确认，不调用工具；等全部回来再统一编排。窗口内并行任务用一次 subagent_inline（tasks）提交，等这次调用返回后再编排。
-- 如果本会话中无关或过时的内容已经很多，主动建议用户执行 /route handoff。
-- 用户说"在这里做/不用开新窗口"时，照做。
+- 用户说「在这里做 / 不用开新窗口」时，照做。
 - 用户明确要求本次换一种执行方式时，照做，用另一个工具。
-${POLICY_COST}`
-		: `${POLICY_TASK_SELF_CONTAINED.replace("子代理", "子进程")}
-${POLICY_MODEL_ID}
-- 需要全新会话时，写一份自包含提示词交给用户，建议用户在新会话中执行。不要用 subagent_inline 调用 session。
+- 请用户在方案间做选择时，凡会引入新机制、明显增加代码量或依赖第三方内部实现的选项，附一句代价说明（「选 X 需要额外实现 Y，风险是 Z」）。
+- 用户明确要求交接时，把自包含说明写到 {{handoffDir}}/<名称>-<日期时间>.md。
+`;
 
-${POLICY_DISPATCH_RULES}
-- 用户说"在这里做"时，照做。
-${POLICY_COST}`;
-	return `
-# 任务分派（task-router）
-${header}
-${modelTable}
+/** 所有被分派的子代理都会注入；角色文件只需写角色特有内容。{{ask}} 按执行方式替换。 */
+const DEFAULT_WORKER_POLICY = `# 子代理约定（task-router）
 
-${tools}
-${extra}${POLICY_APPEND ? `\n${POLICY_APPEND}` : ""}`;
+你是被调用方分派出来的子代理，看不到调用方会话的上下文，只依据任务提示词工作。
+
+- 只做任务提示词范围内的事，不重新设计方案、不扩大范围。
+- 提示词有歧义、方案按原样做不到、或需要越界 / 引入明显更复杂的新机制时：{{ask}}说明遇到了什么、可选做法及各自代价、推荐哪个。
+- 删除、覆盖等不可逆操作只在任务明确要求的范围内进行。
+- 除非任务要求，不要 git commit。
+- 每个结论给出依据（命令与关键输出、文件:行号）；没验证过的标明。
+
+## 资源安全（硬性规则）
+- 只能关闭/停止自己本次创建、并记下了 ID（tab/pane/agent）的 herdr 资源；关闭前用 \`herdr tab get\`/\`pane get\` 核对 label、cwd 与 agent_session 仍是自己创建的。
+- 不得关闭任何 workspace；不得关闭用户或其他会话的 tab/pane，即使看起来像测试残留。
+- 删除会话文件只能按自己记录的完整文件路径逐个删除，不得删除整个 \`~/.pi/agent/sessions/\` 子目录。
+- 测试目录名必须带随机后缀（如 \`mktemp -d\`），不要复用固定路径。
+- 归属不确定的资源一律保留，在汇报中列出，由用户决定。
+
+## 汇报
+最后一条回复就是交回调用方的汇报，简短。角色说明另有格式时以角色为准，否则用：
+
+\`\`\`
+## 结果
+## 修改的文件（没有写“无”）
+## 验证情况
+## 偏差（与任务不一致之处及原因，没有写“无”）
+## 遗留问题 / 需要调用方决定的事
+\`\`\`
+`;
+
+const WORKER_ASK = SUBAGENT_ID && !INLINE_SUBAGENT
+	? "用 caller_ping 询问调用方，"
+	: "停止执行，在汇报中";
+
+function applyPolicyPlaceholders(text: string): string {
+	return text.replaceAll("{{handoffDir}}", HANDOFF_DIR_PROMPT).replaceAll("{{ask}}", WORKER_ASK);
+}
+
+function ensureDefaultFile(path: string, content: string, label: string): string | undefined {
+	if (existsSync(path)) return undefined;
+	try {
+		writeFileSync(path, content, "utf8");
+		return undefined;
+	} catch (e: any) {
+		return `未能写入默认${label}文件 ${path}（${String(e?.message ?? e).slice(0, 120)}）`;
+	}
+}
+
+function loadRuleFile(
+	path: string,
+	fallback: string,
+	label: string,
+): { text: string; source: "file" | "builtin"; warning?: string } {
+	if (!existsSync(path)) return { text: fallback, source: "builtin" };
+	try {
+		return { text: readFileSync(path, "utf8"), source: "file" };
+	} catch (e: any) {
+		return {
+			text: fallback,
+			source: "builtin",
+			warning: `读取${label}文件 ${path} 失败（${String(e?.message ?? e).slice(0, 120)}），已改用内置默认`,
+		};
+	}
+}
+
+const POLICY_FILE_ENSURE_WARNING = joinWarnings(
+	ensureDefaultFile(DEFAULT_POLICY_PATH, DEFAULT_BEHAVIOR_POLICY, "行为规则"),
+	ensureDefaultFile(WORKER_POLICY_PATH, DEFAULT_WORKER_POLICY, "子代理约定"),
+);
+const POLICY_LOAD = loadRuleFile(POLICY_FILE, DEFAULT_BEHAVIOR_POLICY, "行为规则");
+const WORKER_POLICY_LOAD = loadRuleFile(WORKER_POLICY_PATH, DEFAULT_WORKER_POLICY, "子代理约定");
+const POLICY_WARNING = joinWarnings(
+	POLICY_FILE_ENSURE_WARNING,
+	POLICY_LOAD.warning,
+	WORKER_POLICY_LOAD.warning,
+);
+/** 被分派的子代理；与 spawning 无关。handoff_open 开的会话已去掉 PI_SUBAGENT_* / PI_INLINE_*，是普通会话 */
+const DISPATCHED_WORKER = !!SUBAGENT_ID || INLINE_SUBAGENT;
+const ROLE_PROTOCOL = DISPATCHED_WORKER ? applyPolicyPlaceholders(WORKER_POLICY_LOAD.text).trim() : "";
+
+function blockedToolNames(): string[] {
+	const names: string[] = [];
+	if (!FEATURES.windowSubagent) names.push("subagent");
+	if (!FEATURES.inlineSubagent) names.push("subagent_inline");
+	if (!FEATURES.handoff) names.push("handoff_open");
+	return names;
+}
+
+function deactivateBlockedTools(pi: ExtensionAPI, selectedTools?: string[]): void {
+	const blocked = new Set(blockedToolNames());
+	if (blocked.size === 0) return;
+	const current =
+		selectedTools ?? (typeof pi.getActiveTools === "function" ? pi.getActiveTools.call(pi) : []);
+	if (!Array.isArray(current)) return;
+	const next = current.filter((name) => !blocked.has(name));
+	if (next.length === current.length) return;
+	if (selectedTools) {
+		selectedTools.length = 0;
+		selectedTools.push(...next);
+	}
+	if (typeof pi.setActiveTools === "function") {
+		try {
+			pi.setActiveTools(next);
+		} catch {
+			// 加载期或运行时未就绪时仍靠 tool_call 拦截
+		}
+	}
+}
+
+function buildFacts(herdr: boolean, features: Features = FEATURES): string {
+	const header = herdr
+		? "本会话固定使用一个模型。可用模型："
+		: "本会话固定使用一个模型。当前不在 herdr 中，无法开新窗口。可用模型：";
+	const sections: string[] = [];
+	const inlineOn = features.inlineSubagent;
+	const windowOn = herdr && features.windowSubagent;
+	const handoffOn = features.handoff;
+
+	if (inlineOn) {
+		const lines = herdr ? INLINE_ROLE_LINES : DISPATCH_ROLE_LINES;
+		sections.push(
+			lines
+				? `窗口内同步执行（工具 subagent_inline，结果直接返回；多个窗口内子任务用 tasks 模式一次性提交）：\n${lines}`
+				: "窗口内同步执行：工具 subagent_inline 可用。",
+		);
+	}
+
+	if (windowOn && WINDOW_ROLE_LINES) {
+		sections.push(`开新窗口异步执行（工具 subagent，结果会自动回到本会话，不要轮询或等待）：\n${WINDOW_ROLE_LINES}`);
+	}
+
+	if (handoffOn && herdr) {
+		sections.push(
+			`交接当前任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。交接默认沿用当前模型。\n- 与主题无关的新任务同样用这种方式在新窗口开普通会话：说明里写任务本身（背景、目标、相关文件、验收标准、「第一步」），model 和 thinking 按任务难度选。`,
+		);
+	} else if (handoffOn) {
+		sections.push(
+			`交接或开始无关新任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md。当前不在 herdr 中，handoff_open 不可用；把提示词交给用户在新会话中继续。`,
+		);
+	} else if (!herdr) {
+		sections.push("需要全新会话时，写一份自包含提示词交给用户，建议用户在新会话中执行。");
+	}
+
+	const tools = sections.length ? `当前可用的工具与角色：\n${sections.join("\n")}` : "当前未启用子代理分派或交接。";
+	return `# 任务分派（task-router）\n${header}\n${modelTable}\n\n${tools}`;
+}
+
+function buildPolicy(herdr: boolean, behavior: string = POLICY_LOAD.text, features: Features = FEATURES): string {
+	const facts = buildFacts(herdr, features);
+	const rules = applyPolicyPlaceholders(behavior).trim();
+	const extra = POLICY_APPEND ? `\n${POLICY_APPEND}` : "";
+	return `\n${facts}${rules ? `\n\n${rules}` : ""}${extra}`;
 }
 
 const POLICY_HERDR = buildPolicy(true);
@@ -761,11 +702,7 @@ function normalizeWindowsShellPath(filePath: string): string {
 }
 
 function expandHandoffTilde(filePath: string): string {
-	if (filePath === "~") return homedir();
-	if (filePath.startsWith("~/") || (IS_WIN32 && filePath.startsWith("~\\"))) {
-		return join(homedir(), filePath.slice(2));
-	}
-	return filePath;
+	return expandUserPath(filePath);
 }
 
 function isPathInsideDir(root: string, file: string): boolean {
@@ -1010,18 +947,21 @@ export {
 	isPiVersionBelow,
 	parsePiVersion,
 	MIN_PI_VERSION,
+	buildPolicy,
+	buildFacts,
+	applyPolicyPlaceholders,
+	DEFAULT_BEHAVIOR_POLICY,
+	validateConfig,
 };
 
 export default function (pi: ExtensionAPI) {
-	let detectionOff = false;
 	let confirmOn = FEATURES.confirm;
-	let analyzerDown = false;
 	/** /route handoff 本轮：handoff_open 成功后，在 agent_settled 询问是否关闭本窗口 */
 	let handoffPending = false;
 	let handoffOpened = false;
 	const enqueueDispatchConfirm = createSerialQueue();
 
-	if (IN_HERDR) {
+	if (IN_HERDR && FEATURES.handoff) {
 		pi.registerTool({
 			name: "handoff_open",
 			label: "交接开窗",
@@ -1051,9 +991,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		ensureThinkingOn(pi, ctx);
+		deactivateBlockedTools(pi);
 		if (CONFIG_WARNING) {
 			if (ctx.hasUI) ctx.ui.notify(CONFIG_WARNING, ROUTING_PAUSED ? "error" : "warning");
 			else if (ROUTING_PAUSED) console.error(`[task-router] ${CONFIG_WARNING}`);
+		}
+		if (POLICY_WARNING) {
+			if (ctx.hasUI) ctx.ui.notify(POLICY_WARNING, "warning");
+			else console.error(`[task-router] ${POLICY_WARNING}`);
 		}
 		const runtimeWarnings = collectRuntimeWarnings(pi);
 		if (runtimeWarnings.length === 0) return;
@@ -1066,133 +1011,33 @@ export default function (pi: ExtensionAPI) {
 		ensureThinkingOn(pi, ctx);
 	});
 
-	/** 先用分析模型；失败时改用当前会话模型并提示。都失败返回 undefined。 */
-	async function analyze<T>(
-		ctx: ExtensionContext,
-		viaClassifier: () => Promise<T | undefined>,
-		viaChat: (model: any) => Promise<T | undefined>,
-	): Promise<T | undefined> {
-		try {
-			let r: T | undefined;
-			if (ANALYZER.type === "classifier") r = await viaClassifier();
-			else {
-				const m = ctx.modelRegistry.find(ANALYZER.provider, ANALYZER.id);
-				if (!m) throw new Error("模型不在目录中或未配置凭据");
-				r = await viaChat(m);
-			}
-			if (analyzerDown) {
-				analyzerDown = false;
-				ctx.ui.setStatus("task-router-analyzer", undefined);
-				ctx.ui.notify(`✓ 分析模型 ${ANALYZER_REF} 已恢复`, "info");
-			}
-			return r;
-		} catch (e: any) {
-			const cur = ctx.model;
-			const curRef = cur ? `${cur.provider}/${cur.id}` : undefined;
-			if (!analyzerDown) {
-				analyzerDown = true;
-				ctx.ui.notify(
-					`⚠ 分析模型 ${ANALYZER_REF} 不可用（${String(e?.message ?? e).slice(0, 120)}）${curRef ? `，改用当前模型 ${curRef} 分析` : ""}`,
-					"warning",
-				);
-				ctx.ui.setStatus("task-router-analyzer", `分析：${curRef ?? "无"}（${ANALYZER.id} 不可用）`);
-			}
-			if (!cur || curRef === ANALYZER_REF) return undefined;
-			try {
-				return await viaChat(cur);
-			} catch (e2: any) {
-				ctx.ui.notify(`⚠ 当前模型分析也失败（${String(e2?.message ?? e2).slice(0, 80)}），按默认处理`, "warning");
-				return undefined;
-			}
-		}
-	}
-
-	const analyzeFirst = (ctx: ExtensionContext, text: string) =>
-		analyze<FirstResult>(
-			ctx,
-			async () => {
-				const a = await classifyAnswers(ctx, { task: text.slice(0, 12_000) }, {
-					model: {
-						type: "choice",
-						instructions: "Pick the cheapest model that can handle the coding-agent task in `task` well. Reserve the strongest/most expensive model for truly hard design/orchestration work.",
-						criteria: MODEL_CRITERIA,
-					},
-					difficulty: { type: "choice", instructions: "How demanding is the task in `task`?", criteria: DIFFICULTY_CRITERIA },
-				});
-				const model = a.model?.choice;
-				if (!isPick(model)) return undefined;
-				const difficulty = a.difficulty?.choice;
-				return {
-					model,
-					thinking: DIFFICULTY_LEVEL[difficulty] ?? "medium",
-					difficulty,
-					reason: `${ANALYZER.id}：${model} ${pct(a.model)}，难度 ${difficulty ?? "?"}`,
-				};
-			},
-			async (m) => normalizeFirst(await chatJson(ctx, m, FIRST_SYSTEM, text.slice(0, 12_000))),
-		);
-
-	const analyzeNext = (ctx: ExtensionContext, topic: string, lastAssistant: string, text: string) =>
-		analyze<NextResult>(
-			ctx,
-			async () => {
-				const a = await classifyAnswers(
-					ctx,
-					{ session_topic: topic, last_assistant_reply: lastAssistant, new_user_message: text.slice(0, 6000) },
-					{
-						relation: {
-							type: "choice",
-							instructions: "How does `new_user_message` relate to the coding-agent session whose main task is `session_topic`?",
-							criteria: {
-								continuation: "推进、追问、修正、讨论或规划主题任务，适合留在本会话",
-								subtask: "主题任务下可独立执行的一段工作：计划完成后的编码、验证、测试，新一轮编码，清理缓存等小杂务",
-								independent: "与主题任务无关的新任务",
-							},
-						},
-						model: { type: "choice", instructions: "Pick the cheapest model that can handle `new_user_message` well.", criteria: MODEL_CRITERIA },
-						difficulty: { type: "choice", instructions: "How demanding is `new_user_message`?", criteria: DIFFICULTY_CRITERIA },
-					},
-				);
-				const rel = a.relation?.choice as Relation;
-				const confident = (a.relation?.probabilities?.[rel] ?? 0) >= RELATION_MIN_PROB;
-				const relation: Relation = confident && (rel === "subtask" || rel === "independent") ? rel : "continuation";
-				const model = isPick(a.model?.choice) ? (a.model.choice as Pick) : undefined;
-				return {
-					relation,
-					model,
-					thinking: DIFFICULTY_LEVEL[a.difficulty?.choice] ?? "medium",
-					reason: `${ANALYZER.id}：${rel} ${pct(a.relation)}${model ? `，推荐 ${model} ${pct(a.model)}` : ""}`,
-				};
-			},
-			async (m) =>
-				normalizeNext(
-					await chatJson(
-						ctx,
-						m,
-						NEXT_SYSTEM,
-						`## 会话主题\n${topic}\n\n## 最近一次助手回复（节选）\n${lastAssistant}\n\n## 用户新消息\n${text.slice(0, 6000)}`,
-					),
-				),
-		);
 	const warned = new Set<string>();
 
-	function dispatchText(kind: string, original: string, suggestion?: string): string {
+	function defaultDispatchMode(): DispatchMode | undefined {
+		if (IN_HERDR && FEATURES.handoff) return "handoff";
+		if (FEATURES.inlineSubagent) return "inline";
+		return undefined;
+	}
+
+	function dispatchText(kind: string, original: string, suggestion?: string, mode?: DispatchMode): string {
+		const resolved = mode ?? defaultDispatchMode() ?? "inline";
 		const sug = suggestion ? `路由建议模型：${suggestion}；可根据上下文调整。` : "";
 		const how =
-			IN_HERDR && SESSION_WINDOW && kind !== "子任务"
-				? `写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（含「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。${sug}`
-				: IN_HERDR && kind !== "子任务"
-					? `调用 subagent（agent: "session"）开新窗口，按任务难度显式传 model 和 thinking。${sug}`
-				: IN_HERDR
-					? `调用工具分派：${INLINE_ROLES.join(" / ") || "（无）"} 用 subagent_inline（窗口内同步）；${WINDOW_ROLES.join(" / ") || "（无）"} 用 subagent（开新窗口）；session 始终 subagent。${sug}`
-					: `调用 subagent_inline 分派（${DISPATCH_ROLES.join(" / ") || "（无）"}，窗口内同步）。session 在此环境不可用。${sug}`;
+			resolved === "handoff"
+				? `写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（背景、目标、相关文件、验收标准、「第一步」），再调用 handoff_open（file、model、thinking，model 和 thinking 按任务难度选）。新窗口是普通会话，结果不回传。${sug}`
+				: `调用 subagent_inline 在窗口内同步执行（${(IN_HERDR ? INLINE_ROLES : DISPATCH_ROLES).join(" / ") || DISPATCH_ROLES.join(" / ") || "（无）"}）。${sug}`;
 		return `[task-router] 用户提出了下面这个应分派出去的${kind}。不要在本会话中执行它。结合当前会话上下文写一份自包含的任务提示词，${how}\n\n用户原话：\n${original}`;
 	}
 
 	// 系统提示注入（自动执行的子窗口由角色定义负责，不注入）
 	pi.on("before_agent_start", (event) => {
-		if (IS_WORKER || ROUTING_PAUSED) return;
-		return { systemPrompt: event.systemPrompt + "\n" + (IN_HERDR ? POLICY_HERDR : POLICY_PLAIN) };
+		// 子代理约定与路由开关无关，始终注入
+		const protocol = ROLE_PROTOCOL ? `\n${ROLE_PROTOCOL}\n` : "";
+		if (IS_WORKER || ROUTING_PAUSED) return protocol ? { systemPrompt: event.systemPrompt + protocol } : undefined;
+		const opts = (event as { systemPromptOptions?: { selectedTools?: string[] } }).systemPromptOptions;
+		if (opts && Array.isArray(opts.selectedTools)) deactivateBlockedTools(pi, opts.selectedTools);
+		else deactivateBlockedTools(pi);
+		return { systemPrompt: event.systemPrompt + protocol + "\n" + (IN_HERDR ? POLICY_HERDR : POLICY_PLAIN) };
 	});
 
 	// 输入拦截
@@ -1206,31 +1051,32 @@ export default function (pi: ExtensionAPI) {
 		const msgs = branchMessages(ctx);
 		const hasUser = msgs.some((m) => m.role === "user");
 
-		if (text.startsWith(">>")) return { action: "transform", text: dispatchText("新任务", text.slice(2).trim()) };
+		if (text.startsWith(">>")) {
+			const task = text.slice(2).trim();
+			const mode = defaultDispatchMode();
+			if (!mode) {
+				if (ctx.hasUI) ctx.ui.notify("交接与窗口内子代理均已关闭，已在本会话处理", "warning");
+				return task ? { action: "transform", text: task } : { action: "handled" };
+			}
+			return { action: "transform", text: dispatchText("新任务", task, undefined, mode) };
+		}
 
-		// 首条消息：选模型
+		// 首条消息：@代号 手动指定模型
 		if (!hasUser) {
 			if (SUBAGENT_ID || INLINE_SUBAGENT || EXPLICIT_MODEL) return { action: "continue" };
 			const modelChanges = ctx.sessionManager.getBranch().filter((e: any) => e.type === "model_change").length;
 			if (modelChanges > 1) return { action: "continue" };
 
-			const pick = heuristicFirst(text);
-			if (pick?.reason === "手动指定") text = text.replace(PREFIX_RE, "").trimStart();
-			else if (!FEATURES.autoModel) return { action: "continue" };
-			let info: any = pick;
-			if (!pick) {
-				ctx.ui.setStatus("task-router", "⇢ 分析任务…");
-				const j = await analyzeFirst(ctx, text);
-				ctx.ui.setStatus("task-router", undefined);
-				info = j ?? { model: DEFAULT_PICK, thinking: "medium", reason: "判断失败，使用默认" };
-			}
+			const info = parseModelPrefix(text);
+			if (!info) return { action: "continue" };
+			text = text.replace(PREFIX_RE, "").trimStart();
 			const p: Pick = info.model;
 			const lv = asLevel(info.thinking);
 			const ok = await applyModel(pi, ctx, p, lv);
 			const label = `${MODELS[p].id} • ${lv}`;
 			ctx.ui.notify(
 				ok
-					? `⇢ 本会话模型：${label}${info.scenario ? `\n  ${info.scenario} / ${info.difficulty}` : ""} ｜ ${info.reason}`
+					? `⇢ 本会话模型：${label} ｜ ${info.reason}`
 					: `⚠ 切换到 ${label} 失败（无凭据？），保持当前模型`,
 				ok ? "info" : "warning",
 			);
@@ -1242,29 +1088,9 @@ export default function (pi: ExtensionAPI) {
 				topic: text.slice(0, 500),
 				reason: info.reason,
 			});
-			return text === event.text.trim() ? { action: "continue" } : { action: "transform", text };
+			return { action: "transform", text };
 		}
 
-		// 后续消息：判断关系（>> 前缀在上方已处理，关 relationCheck 后仍有效）
-		if (!FEATURES.relationCheck || detectionOff || text.length < 20 || CONTINUE_RE.test(text)) return { action: "continue" };
-		const topic = routerEntry(ctx)?.topic ?? textOf(msgs.find((m) => m.role === "user")?.content).slice(0, 500);
-		const lastAssistant = textOf([...msgs].reverse().find((m) => m.role === "assistant")?.content).slice(-1500);
-		ctx.ui.setStatus("task-router", "⇢ 判断任务关系…");
-		const j = await analyzeNext(ctx, topic, lastAssistant, text);
-		ctx.ui.setStatus("task-router", undefined);
-		if (!j || j.relation === "continuation") return { action: "continue" };
-
-		const kind = j.relation === "subtask" ? "子任务" : "独立新任务";
-		const sug = j.model ? `${ref(j.model)} • ${asLevel(j.thinking)}` : undefined;
-		const choice = await ctx.ui.select(`💡 这像是一个${kind}：${j.reason ?? ""}${sug ? `\n   推荐模型：${sug}` : ""}`, [
-			IN_HERDR ? "让当前 agent 写提示词并开新窗口执行" : "让当前 agent 写提示词并用窗口内子代理执行",
-			"在本会话继续",
-		]);
-		if (choice === undefined) {
-			ctx.ui.notify("已取消发送", "info");
-			return { action: "handled" };
-		}
-		if (choice.startsWith("让当前")) return { action: "transform", text: dispatchText(kind, text, sug) };
 		return { action: "continue" };
 	});
 
@@ -1309,13 +1135,6 @@ export default function (pi: ExtensionAPI) {
 
 	// 拦截 subagent / subagent_inline：确认 / 编辑 / 换模型 / 取消
 	pi.on("tool_call", async (event, ctx) => {
-		// session 角色是交接/独立会话窗口，由用户决定何时结束
-		if (event.toolName === "subagent_done" && SUBAGENT_ROLE === "session") {
-			return {
-				block: true,
-				reason: "这是交接/独立会话窗口，由用户决定何时结束。不要调用 subagent_done，汇报当前状态后等待用户的下一条指令。",
-			};
-		}
 		if (WORKER_DENY_SPAWN && SPAWN_TOOL_NAMES.has(event.toolName)) {
 			return {
 				block: true,
@@ -1323,19 +1142,29 @@ export default function (pi: ExtensionAPI) {
 					"当前角色不允许继续分派。不要调用 subagent、subagent_inline、subagent_interrupt、subagent_resume、subagents_list、handoff_open，直接完成任务。",
 			};
 		}
+		if (event.toolName === "subagent" && !FEATURES.windowSubagent) {
+			return {
+				block: true,
+				reason: "开新窗口分派已关闭（features.windowSubagent=false）。不要调用 subagent。",
+			};
+		}
+		if (event.toolName === "subagent_inline" && !FEATURES.inlineSubagent) {
+			return {
+				block: true,
+				reason: "窗口内子代理已关闭（features.inlineSubagent=false）。不要调用 subagent_inline。",
+			};
+		}
+		if (event.toolName === "handoff_open" && !FEATURES.handoff) {
+			return {
+				block: true,
+				reason: "交接已关闭（features.handoff=false）。不要调用 handoff_open。",
+			};
+		}
 		const isInline = event.toolName === "subagent_inline";
 		const isWindow = event.toolName === "subagent";
 		if (!isInline && !isWindow) return;
 		const input = event.input as any;
 		const jobs = dispatchJobs(input);
-		if (isInline && jobs.some((j) => j.agent === "session")) {
-			return {
-				block: true,
-				reason: IN_HERDR
-					? "session 角色必须开新窗口，不能用 subagent_inline。请改用 subagent（agent: \"session\"）。"
-					: "session 角色在非 herdr 环境中不可用，不能用 subagent_inline。请把自包含提示词交给用户在新会话中执行。",
-			};
-		}
 		if (IS_WORKER || !confirmOn || !ctx.hasUI) return;
 
 		const confirmTimeoutSec = isInline ? INLINE_CONFIRM_TIMEOUT_SEC : CONFIRM_TIMEOUT_SEC;
@@ -1442,13 +1271,14 @@ export default function (pi: ExtensionAPI) {
 
 	// /route 命令
 	pi.registerCommand("route", {
-		description: "task-router：status | handoff [说明] | new <任务> | off | on | confirm on|off",
+		description: "task-router：status | handoff [说明] | new <任务> | confirm on|off",
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			const extra = rest.join(" ");
 			const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "当前模型";
 			switch (sub || "status") {
 				case "handoff":
+					if (!FEATURES.handoff) return ctx.ui.notify("交接已关闭（features.handoff=false）", "warning");
 					if (IN_HERDR && ctx.hasUI) {
 						const n = countRunningSubagents();
 						if (n > 0) {
@@ -1471,23 +1301,24 @@ export default function (pi: ExtensionAPI) {
 						}${extra ? `\n用户补充：${extra}` : ""}`,
 					);
 					return;
-				case "new":
+				case "new": {
 					if (!extra) return ctx.ui.notify("用法：/route new <任务>", "warning");
-					pi.sendUserMessage(dispatchText("新任务", extra));
+					const mode = defaultDispatchMode();
+					if (!mode) return ctx.ui.notify("交接与窗口内子代理均已关闭，/route new 不可用", "warning");
+					pi.sendUserMessage(dispatchText("新任务", extra, undefined, mode));
 					return;
-				case "off":
-					detectionOff = true;
-					return ctx.ui.notify("本会话已关闭新任务检测", "info");
-				case "on":
-					detectionOff = false;
-					return ctx.ui.notify("本会话已开启新任务检测", "info");
+				}
 				case "confirm":
 					confirmOn = rest[0] !== "off";
 					return ctx.ui.notify(`分派前确认：${confirmOn ? "开" : "关"}`, "info");
 				default: {
 					const r = routerEntry(ctx);
 					const u = ctx.getContextUsage();
-					const rolePlace = (name: string) => (IN_HERDR && !INLINE_ROLE_SET.has(name) ? "新窗口" : "窗口内");
+					const rolePlace = (name: string) => {
+						const inline = !IN_HERDR || INLINE_ROLE_SET.has(name);
+						if (inline) return FEATURES.inlineSubagent ? "窗口内" : "窗口内（已关）";
+						return FEATURES.windowSubagent ? "新窗口" : "新窗口（已关）";
+					};
 					const roleLines =
 						DISPATCH_ROLES.length === 0
 							? ["角色：（无）"]
@@ -1504,9 +1335,8 @@ export default function (pi: ExtensionAPI) {
 										? `窗口内子代理：${INLINE_AGENT || "（无）"}`
 										: "",
 							`上下文：${u?.tokens ?? "?"} tokens（${u?.percent != null ? Math.round(u.percent) : "?"}%）`,
-							`分析模型：${ANALYZER_REF}${analyzerDown ? "（不可用，改用当前模型）" : ""}`,
 							`配置：${ROUTING_PAUSED ? "已暂停（读取/校验失败）" : CONFIG_PATH}`,
-							`新任务检测：${detectionOff ? "关" : "开"} ｜ 分派确认：${confirmOn ? "开" : "关"} ｜ herdr：${IN_HERDR ? "是" : "否"}`,
+							`分派确认：${confirmOn ? "开" : "关"} ｜ herdr：${IN_HERDR ? "是" : "否"}`,
 							piVersionStatusLine(),
 							IN_HERDR
 								? `subagent 工具：${hasSubagentTool(pi) ? "有" : "无（开新窗口分派不可用）"}`
@@ -1517,7 +1347,10 @@ export default function (pi: ExtensionAPI) {
 							`确认超时：${CONFIRM_TIMEOUT_SEC === 0 ? "关" : `${CONFIRM_TIMEOUT_SEC} 秒`} ｜ 窗口内确认超时：${INLINE_CONFIRM_TIMEOUT_SEC === 0 ? "关" : `${INLINE_CONFIRM_TIMEOUT_SEC} 秒`}`,
 							...roleLines,
 							featureLine,
+							`行为规则：${POLICY_LOAD.source === "file" ? `文件 ${POLICY_FILE}` : `内置默认（${POLICY_FILE}）`}`,
+							`子代理约定：${WORKER_POLICY_LOAD.source === "file" ? `文件 ${WORKER_POLICY_PATH}` : "内置默认"}`,
 							`policyAppend：${POLICY_APPEND ? `已设置（${POLICY_APPEND.length} 字）` : "未设置"}`,
+							POLICY_WARNING ? `规则警告：${POLICY_WARNING}` : "",
 							CONFIG_WARNING ? `配置警告：${CONFIG_WARNING}` : "",
 						]
 							.filter(Boolean)

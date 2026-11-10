@@ -486,7 +486,6 @@ export default function (pi: ExtensionAPI) {
 			"在当前窗口后台同步执行子任务，结果作为本次工具调用的返回值直接交回（不开新 herdr 窗口，也不要轮询）。",
 			"模式：单个（agent + task）、并行（tasks 数组）。",
 			"可选参数 model、thinking 覆盖角色默认；tasks 的每一项也可单独指定。",
-			"不要用此工具调用 session（交接/独立会话必须开新窗口）。",
 			`只加载用户级角色（${path.join(getAgentDir(), "agents")}）。`,
 		].join(" "),
 		parameters: SubagentParams,

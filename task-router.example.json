@@ -21,31 +21,11 @@
 			"desc": "最强。架构设计与任务编排、跨模块重构、疑难问题。不要用它执行机械步骤"
 		}
 	},
-	"default": "grok",
 	"fallback": "grok",
-	"analyzer": {
-		"type": "classifier",
-		"provider": "typesafe",
-		"id": "jev-latest",
-		"timeoutMs": 15000
-	},
-	"relationMinProb": 0.6,
 	"contextWarn": {
 		"tokens": [150000, 300000],
 		"percent": 60,
 		"userTurns": 20
-	},
-	"roles": {
-		"coder": {
-			"use": "编码（编排/计划完成后的实现、下一轮编码）",
-			"hint": "高难编码显式传 model"
-		},
-		"verifier": {
-			"use": "验证 / 测试 / 验收"
-		},
-		"chore": {
-			"use": "小杂务（清理缓存、整理文件、跑命令、机械批量修改）"
-		}
 	},
 	"confirmTimeoutSec": 30,
 	"dispatch": {
@@ -53,11 +33,13 @@
 		"inlineConfirmTimeoutSec": 10
 	},
 	"features": {
-		"autoModel": true,
-		"relationCheck": true,
 		"confirm": true,
 		"contextWarn": true,
-		"handoffAutoClose": true
+		"handoffAutoClose": true,
+		"windowSubagent": true,
+		"inlineSubagent": true,
+		"handoff": true
 	},
+	"policyFile": "~/.pi/agent/task-router.policy.md",
 	"policyAppend": ""
 }

@@ -14,6 +14,8 @@ export interface AgentConfig {
 	thinking?: string;
 	/** Frontmatter `spawning`. Undefined when the field is absent. */
 	spawning?: boolean;
+	/** Frontmatter `disable-model-invocation` (pi-herdr-subagents): hide from dispatch policy. */
+	disableModelInvocation: boolean;
 	systemPrompt: string;
 	filePath: string;
 }
@@ -27,14 +29,9 @@ export const SPAWNING_DENIED_TOOLS = [
 	"subagents_list",
 ] as const;
 
-/**
- * `spawning: false`, or spawning undeclared and not session → deny further dispatch.
- * session may keep spawning unless it explicitly sets `spawning: false`.
- */
-export function shouldDenySpawning(agent: Pick<AgentConfig, "name" | "spawning">): boolean {
-	if (agent.spawning === false) return true;
-	if (agent.spawning === undefined && agent.name !== "session") return true;
-	return false;
+/** Same semantics as pi-herdr-subagents: only `spawning: false` denies further dispatch. */
+export function shouldDenySpawning(agent: Pick<AgentConfig, "spawning">): boolean {
+	return agent.spawning === false;
 }
 
 /**
@@ -52,6 +49,7 @@ type AgentFrontmatter = {
 	model?: unknown;
 	thinking?: unknown;
 	spawning?: unknown;
+	"disable-model-invocation"?: unknown;
 };
 
 function parseOptionalBoolean(value: unknown): boolean | undefined {
@@ -126,6 +124,7 @@ function loadAgentsFromDir(dir: string): AgentConfig[] {
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 			thinking: typeof frontmatter.thinking === "string" ? frontmatter.thinking : undefined,
 			spawning: parseOptionalBoolean(frontmatter.spawning),
+			disableModelInvocation: parseOptionalBoolean(frontmatter["disable-model-invocation"]) === true,
 			systemPrompt: body,
 			filePath,
 		});
