@@ -113,7 +113,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 |---|---|
 | `models` | 代号 → `{ provider, id, desc }`。`desc` 写进分派策略的模型表，供分派时选模型 |
 | `fallback` | 请求失败时提示切换到的代号 |
-| `contextWarn` | `{ tokens: number[], percent, userTurns }`，任一达到即提醒交接 |
+| `contextWarn` | 可选，`{ tokens, percent, userTurns }`，任一达到即提醒交接，每项每会话提醒一次。`tokens` 为 token 数数组，缺省 `[300000]`，空数组不按 token 提醒；`percent` 为上下文窗口占用百分比，缺省不按百分比提醒；`userTurns` 为用户消息轮数，缺省 `20`，`0` 不按轮数提醒 |
 | `confirmTimeoutSec` | 新窗口分派确认的自动执行秒数，`0` 关闭 |
 | `dispatch.inlineRoles` | 在 herdr 中也走 `subagent_inline` 的角色 |
 | `dispatch.inlineConfirmTimeoutSec` | 窗口内分派确认的自动执行秒数，`0` 关闭 |

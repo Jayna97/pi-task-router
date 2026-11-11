@@ -74,7 +74,8 @@ type Features = Record<FeatureKey, boolean>;
 interface RouterConfig {
 	models: Record<string, ModelSpec>;
 	fallback: string;
-	contextWarn: { tokens: number[]; percent: number; userTurns: number };
+	/** 任一达到即提醒交接；percent 缺省不按百分比提醒，userTurns 为 0 不按轮数提醒 */
+	contextWarn: { tokens: number[]; percent?: number; userTurns: number };
 	/** 分派确认框首次弹出后的自动执行秒数；0 关闭 */
 	confirmTimeoutSec: number;
 	/** 窗口内执行：哪些角色走 subagent_inline，以及其确认超时 */
@@ -85,6 +86,9 @@ interface RouterConfig {
 	/** 行为规则 markdown 路径 */
 	policyFile: string;
 }
+
+/** 上下文提醒缺省阈值：300k tokens 或 20 轮用户消息 */
+const DEFAULT_CONTEXT_WARN = { tokens: [300_000], userTurns: 20 };
 
 const FEATURE_KEYS: FeatureKey[] = [
 	"confirm",
@@ -174,12 +178,15 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 		if (!(s in models)) throw new Error(`${name} 必须是 models 中的代号`);
 		return s;
 	};
-	if (!isPlainObject(raw.contextWarn)) throw new Error("contextWarn 必须是对象");
-	const tokens = raw.contextWarn.tokens;
-	if (!Array.isArray(tokens) || tokens.length === 0 || tokens.some((t) => typeof t !== "number" || !Number.isFinite(t) || t <= 0))
-		throw new Error("contextWarn.tokens 必须是正数数组");
-	const percent = reqNum(raw.contextWarn.percent, "contextWarn.percent");
-	const userTurns = reqNum(raw.contextWarn.userTurns, "contextWarn.userTurns");
+	if (raw.contextWarn != null && !isPlainObject(raw.contextWarn)) throw new Error("contextWarn 必须是对象");
+	const cw = isPlainObject(raw.contextWarn) ? raw.contextWarn : {};
+	const tokens = cw.tokens ?? DEFAULT_CONTEXT_WARN.tokens;
+	if (!Array.isArray(tokens) || tokens.some((t) => typeof t !== "number" || !Number.isFinite(t) || t <= 0))
+		throw new Error("contextWarn.tokens 必须是正数数组（空数组表示不按 token 提醒）");
+	const percent = cw.percent == null ? undefined : reqNum(cw.percent, "contextWarn.percent");
+	if (percent !== undefined && (percent <= 0 || percent > 100)) throw new Error("contextWarn.percent 必须在 (0, 100] 内");
+	const userTurns = optNum(cw.userTurns, DEFAULT_CONTEXT_WARN.userTurns, "contextWarn.userTurns");
+	if (userTurns < 0) throw new Error("contextWarn.userTurns 必须是非负数（0 表示不按轮数提醒）");
 	const warnings: string[] = [];
 	if (raw.roles != null) warnings.push("roles 已废弃（角色说明以角色文件为准），已忽略");
 	const confirmTimeoutSec = optNum(raw.confirmTimeoutSec, 30, "confirmTimeoutSec");
@@ -219,7 +226,7 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 		cfg: {
 			models,
 			fallback: inModels("fallback", raw.fallback),
-			contextWarn: { tokens: tokens as number[], percent, userTurns },
+			contextWarn: { tokens: [...(tokens as number[])].sort((a, b) => a - b), percent, userTurns },
 			confirmTimeoutSec,
 			dispatch: { inlineRoles, inlineConfirmTimeoutSec },
 			features,
@@ -240,7 +247,7 @@ function pausedConfig(): RouterConfig {
 	return {
 		models: {},
 		fallback: "",
-		contextWarn: { tokens: [], percent: 100, userTurns: Number.MAX_SAFE_INTEGER },
+		contextWarn: { tokens: [], userTurns: 0 },
 		confirmTimeoutSec: 0,
 		dispatch: { inlineRoles: [], inlineConfirmTimeoutSec: 0 },
 		features: {
@@ -995,6 +1002,16 @@ function matchingPick(provider?: string, id?: string): Pick | undefined {
 	return (Object.keys(MODELS) as Pick[]).find((k) => MODELS[k].provider === provider && MODELS[k].id === id);
 }
 
+function contextWarnSummary(): string {
+	if (!FEATURES.contextWarn) return "关";
+	const parts = [
+		...CONTEXT_WARN_TOKENS.map((t) => `${Math.round(t / 1000)}k tokens`),
+		...(CONTEXT_WARN_PERCENT !== undefined ? [`${CONTEXT_WARN_PERCENT}%`] : []),
+		...(USER_TURN_WARN > 0 ? [`${USER_TURN_WARN} 轮`] : []),
+	];
+	return parts.length ? `${parts.join(" 或 ")}（任一达到）` : "无阈值";
+}
+
 function nextContextWarn(
 	sid: string,
 	usage: { tokens?: number; percent?: number } | undefined,
@@ -1008,11 +1025,11 @@ function nextContextWarn(
 		}
 	}
 	const percentKey = `${sid}:p`;
-	if ((usage?.percent ?? 0) >= CONTEXT_WARN_PERCENT && !warned.has(percentKey)) {
+	if (CONTEXT_WARN_PERCENT !== undefined && (usage?.percent ?? 0) >= CONTEXT_WARN_PERCENT && !warned.has(percentKey)) {
 		return { key: percentKey, reason: `上下文已用 ${Math.round(usage!.percent!)}%` };
 	}
 	const turnsKey = `${sid}:u`;
-	if (userTurns >= USER_TURN_WARN && !warned.has(turnsKey)) {
+	if (USER_TURN_WARN > 0 && userTurns >= USER_TURN_WARN && !warned.has(turnsKey)) {
 		return { key: turnsKey, reason: `本会话已 ${userTurns} 轮` };
 	}
 	return undefined;
@@ -1442,6 +1459,7 @@ export default function (pi: ExtensionAPI) {
 										? `窗口内子代理：${INLINE_AGENT || "（无）"}`
 										: "",
 							`上下文：${u?.tokens ?? "?"} tokens（${u?.percent != null ? Math.round(u.percent) : "?"}%）`,
+							`交接提醒：${contextWarnSummary()}`,
 							`配置：${ROUTING_PAUSED ? "读取/校验失败，未注入分派规则" : CONFIG_PATH}`,
 							`分派确认：${confirmOn ? "开" : "关"} ｜ herdr：${IN_HERDR ? "是" : "否"}`,
 							piVersionStatusLine(),

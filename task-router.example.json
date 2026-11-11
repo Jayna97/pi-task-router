@@ -23,8 +23,7 @@
 	},
 	"fallback": "grok",
 	"contextWarn": {
-		"tokens": [150000, 300000],
-		"percent": 60,
+		"tokens": [300000],
 		"userTurns": 20
 	},
 	"confirmTimeoutSec": 30,
