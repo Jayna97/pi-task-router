@@ -5,6 +5,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { SPAWN_TOOLS } from "../herdr-subagents.ts";
 
 export interface AgentConfig {
 	name: string;
@@ -21,13 +22,7 @@ export interface AgentConfig {
 }
 
 /** Tools a non-spawning worker must not call. */
-export const SPAWNING_DENIED_TOOLS = [
-	"subagent",
-	"subagent_inline",
-	"subagent_interrupt",
-	"subagent_resume",
-	"subagents_list",
-] as const;
+export const SPAWNING_DENIED_TOOLS: readonly string[] = [...SPAWN_TOOLS, "subagent_inline"];
 
 /** Same semantics as pi-herdr-subagents: only `spawning: false` denies further dispatch. */
 export function shouldDenySpawning(agent: Pick<AgentConfig, "spawning">): boolean {

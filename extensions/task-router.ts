@@ -24,6 +24,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { Type } from "typebox";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as HS from "./herdr-subagents.ts";
 import { discoverAgents, shouldDenySpawning, type AgentConfig } from "./inline-subagent/agents.ts";
 
 /** 老版本可能没有 VERSION 导出；命名空间导入避免加载失败。 */
@@ -344,7 +345,7 @@ function hasSubagentTool(pi: ExtensionAPI): boolean {
 		if (typeof getAll !== "function") return false;
 		const tools = getAll.call(pi) as Array<string | { name?: string }>;
 		if (!Array.isArray(tools)) return false;
-		return tools.some((t) => (typeof t === "string" ? t : t?.name) === "subagent");
+		return tools.some((t) => (typeof t === "string" ? t : t?.name) === HS.WINDOW_TOOL);
 	} catch {
 		return false;
 	}
@@ -363,19 +364,22 @@ function collectRuntimeWarnings(pi: ExtensionAPI): string[] {
 	}
 	if (IN_HERDR && FEATURES.windowSubagent && !hasSubagentTool(pi)) {
 		out.push(
-			"开新窗口分派不可用：未找到 subagent 工具。请执行 pi install npm:pi-herdr-subagents，或把可分派角色写进 dispatch.inlineRoles。",
+			`开新窗口分派不可用：未找到 ${HS.WINDOW_TOOL} 工具。请执行 ${HS.INSTALL_HINT}，或把可分派角色写进 dispatch.inlineRoles。`,
 		);
 	}
 	if (IN_HERDR && FEATURES.windowSubagent && IS_WIN32 && !WIN_BASH_ON_PATH) {
 		out.push(
-			"pi-herdr-subagents 开新窗口需要 bash。请把 Git Bash 的 bin 目录（如 C:\\Program Files\\Git\\bin）加入 PATH。",
+			`${HS.PACKAGE_NAME} 开新窗口需要 bash。请把 Git Bash 的 bin 目录（如 C:\\Program Files\\Git\\bin）加入 PATH。`,
 		);
 	}
 	return out;
 }
 
-const SUBAGENT_ID = process.env.PI_SUBAGENT_ID; // pi-herdr-subagents 子窗口
-const SUBAGENT_ROLE = process.env.PI_SUBAGENT_AGENT ?? "";
+const WINDOW_WORKER = HS.windowWorker();
+const SUBAGENT_ID = WINDOW_WORKER?.id; // pi-herdr-subagents 子窗口
+const SUBAGENT_ROLE = WINDOW_WORKER?.agent ?? "";
+/** 本包窗口内子代理的环境变量前缀（inline-subagent 设置） */
+const INLINE_ENV_PREFIX = "PI_INLINE_";
 const INLINE_SUBAGENT = process.env.PI_INLINE_SUBAGENT === "1";
 const INLINE_AGENT = process.env.PI_INLINE_SUBAGENT_AGENT ?? "";
 const CURRENT_AGENT = INLINE_SUBAGENT ? INLINE_AGENT : SUBAGENT_ROLE;
@@ -387,12 +391,9 @@ function computeIsWorker(): boolean {
 }
 const IS_WORKER = computeIsWorker();
 const EXPLICIT_MODEL = process.argv.some((a) => a === "--model" || a.startsWith("--model="));
-const SPAWN_TOOL_NAMES = new Set([
-	"subagent",
+const SPAWN_TOOL_NAMES = new Set<string>([
+	...HS.SPAWN_TOOLS,
 	"subagent_inline",
-	"subagent_interrupt",
-	"subagent_resume",
-	"subagents_list",
 	"handoff_open",
 ]);
 
@@ -513,7 +514,7 @@ const DEFAULT_WORKER_POLICY = `# 子代理约定（task-router）
 `;
 
 const WORKER_ASK = SUBAGENT_ID && !INLINE_SUBAGENT
-	? "用 caller_ping 询问调用方，"
+	? `用 ${HS.ASK_TOOL} 询问调用方，`
 	: "停止执行，在汇报中";
 
 function applyPolicyPlaceholders(text: string): string {
@@ -559,13 +560,13 @@ const POLICY_WARNING = joinWarnings(
 	POLICY_LOAD.warning,
 	WORKER_POLICY_LOAD.warning,
 );
-/** 被分派的子代理；与 spawning 无关。handoff_open 开的会话已去掉 PI_SUBAGENT_* / PI_INLINE_*，是普通会话 */
+/** 被分派的子代理；与 spawning 无关。handoff_open 开的会话已去掉子代理环境变量，是普通会话 */
 const DISPATCHED_WORKER = !!SUBAGENT_ID || INLINE_SUBAGENT;
 const ROLE_PROTOCOL = DISPATCHED_WORKER ? applyPolicyPlaceholders(WORKER_POLICY_LOAD.text).trim() : "";
 
 function blockedToolNames(): string[] {
 	const names: string[] = [];
-	if (!FEATURES.windowSubagent) names.push("subagent");
+	if (!FEATURES.windowSubagent) names.push(HS.WINDOW_TOOL);
 	if (!FEATURES.inlineSubagent) names.push("subagent_inline");
 	if (!FEATURES.handoff) names.push("handoff_open");
 	return names;
@@ -683,13 +684,9 @@ function setSingleTask(input: any, task: string): void {
 
 // ───────────────────────── 扩展 ─────────────────────────
 
-const SUBAGENT_RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
-
-/** 本进程 runningSubagents（父会话自己派生的子窗口）。读不到当 0。 */
-function countRunningSubagents(): number {
-	const map = (globalThis as Record<symbol, any>)[SUBAGENT_RUNTIME_KEY]?.runningSubagents;
-	return map instanceof Map ? map.size : 0;
-}
+const countRunningSubagents = HS.countRunningSubagents;
+/** 交接开的普通会话要清掉的环境变量前缀：上游子窗口 + 本包窗口内子代理 */
+const WORKER_ENV_PREFIXES = [HS.ENV_PREFIX, INLINE_ENV_PREFIX];
 
 function herdrJson(args: string[], timeoutMs = 45_000): any {
 	try {
@@ -764,7 +761,7 @@ function startHandoffPi(paneId: string, agent: string, model: string, thinking: 
 	assertHandoffArg(thinking, "thinking");
 	if (IS_WIN32) {
 		const cmd = [
-			"Get-ChildItem Env: | Where-Object { $_.Name -like 'PI_SUBAGENT_*' -or $_.Name -like 'PI_INLINE_*' } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }",
+			`Get-ChildItem Env: | Where-Object { ${WORKER_ENV_PREFIXES.map((p) => `$_.Name -like '${p}*'`).join(" -or ")} } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }`,
 			`pi.cmd --model ${model} --thinking ${thinking}`,
 		].join("; ");
 		sleepSync(1500);
@@ -777,7 +774,7 @@ function startHandoffPi(paneId: string, agent: string, model: string, thinking: 
 	}
 	execFileSync(
 		"herdr",
-		["pane", "run", paneId, 'for __v in $(env | awk -F= \'/^(PI_SUBAGENT_|PI_INLINE_)/{print $1}\'); do unset "$__v"; done'],
+		["pane", "run", paneId, `for __v in $(env | awk -F= '/^(${WORKER_ENV_PREFIXES.join("|")})/{print $1}'); do unset "$__v"; done`],
 		{ encoding: "utf8", timeout: 10_000 },
 	);
 	sleepSync(400);
@@ -1063,7 +1060,7 @@ export default function (pi: ExtensionAPI) {
 			name: "handoff_open",
 			label: "交接开窗",
 			description:
-				`读取 ${HANDOFF_DIR_PROMPT}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 PI_SUBAGENT_* / PI_INLINE_*，不受子代理监视、不回传）。参数：file；model（provider/id）、thinking 可省略，省略时沿用当前会话的模型和思考等级。`,
+				`读取 ${HANDOFF_DIR_PROMPT}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 ${WORKER_ENV_PREFIXES.map((p) => `${p}*`).join(" / ")}，不受子代理监视、不回传）。参数：file；model（provider/id）、thinking 可省略，省略时沿用当前会话的模型和思考等级。`,
 			promptSnippet: `把交接说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md 后调用，开新 tab 接手。`,
 			parameters: Type.Object({
 				file: Type.String({ description: `交接文件路径，必须在 ${HANDOFF_DIR_PROMPT}/ 下` }),
@@ -1281,13 +1278,13 @@ export default function (pi: ExtensionAPI) {
 			return {
 				block: true,
 				reason:
-					"当前角色不允许继续分派。不要调用 subagent、subagent_inline、subagent_interrupt、subagent_resume、subagents_list、handoff_open，直接完成任务。",
+					`当前角色不允许继续分派。不要调用 ${[...SPAWN_TOOL_NAMES].join("、")}，直接完成任务。`,
 			};
 		}
-		if (event.toolName === "subagent" && !FEATURES.windowSubagent) {
+		if (event.toolName === HS.WINDOW_TOOL && !FEATURES.windowSubagent) {
 			return {
 				block: true,
-				reason: "开新窗口分派已关闭（features.windowSubagent=false）。不要调用 subagent。",
+				reason: `开新窗口分派已关闭（features.windowSubagent=false）。不要调用 ${HS.WINDOW_TOOL}。`,
 			};
 		}
 		if (event.toolName === "subagent_inline" && !FEATURES.inlineSubagent) {
@@ -1303,7 +1300,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 		const isInline = event.toolName === "subagent_inline";
-		const isWindow = event.toolName === "subagent";
+		const isWindow = event.toolName === HS.WINDOW_TOOL;
 		if (!isInline && !isWindow) return;
 		const input = event.input as any;
 		const jobs = dispatchJobs(input);

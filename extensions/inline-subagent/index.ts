@@ -21,6 +21,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getAgentDir, getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { DENY_TOOLS_ENV, ENV_PREFIX as WINDOW_ENV_PREFIX } from "../herdr-subagents.ts";
 import { type AgentConfig, discoverAgents, shouldDenySpawning, SPAWNING_DENIED_TOOLS } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -197,7 +198,7 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 function childProcessEnv(agent: AgentConfig): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	for (const key of Object.keys(env)) {
-		if (key === "PI_DENY_TOOLS" || key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_INLINE_SUBAGENT")) {
+		if (key === DENY_TOOLS_ENV || key.startsWith(WINDOW_ENV_PREFIX) || key.startsWith("PI_INLINE_SUBAGENT")) {
 			delete env[key];
 		}
 	}
@@ -205,7 +206,7 @@ function childProcessEnv(agent: AgentConfig): NodeJS.ProcessEnv {
 	env.PI_INLINE_SUBAGENT_AGENT = agent.name;
 	// pi-herdr-subagents only honors PI_DENY_TOOLS when PI_SUBAGENT_ID is set (new-window workers).
 	// Inline children do not set PI_SUBAGENT_ID; task-router still blocks these tools in tool_call.
-	if (shouldDenySpawning(agent)) env.PI_DENY_TOOLS = SPAWNING_DENIED_TOOLS.join(",");
+	if (shouldDenySpawning(agent)) env[DENY_TOOLS_ENV] = SPAWNING_DENIED_TOOLS.join(",");
 	return env;
 }
 

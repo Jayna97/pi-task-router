@@ -183,6 +183,7 @@ pi-task-router/
 ├── task-router.policy.example.md  # 行为规则示例（同内置默认）
 ├── extensions/
 │   ├── task-router.ts         # 分派策略与确认、交接、失败切 fallback
+│   ├── herdr-subagents.ts     # 对 pi-herdr-subagents 的全部依赖（工具名、环境变量、内部状态）
 │   └── inline-subagent/
 │       ├── index.ts           # subagent_inline 工具
 │       └── agents.ts          # 角色发现
