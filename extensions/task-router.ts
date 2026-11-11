@@ -7,8 +7,8 @@
  * - auto-exit 与 interactive 只对新窗口执行（subagent）生效；窗口内执行不读这两项
  * - 上下文过长：提醒 /route handoff 交接
  * - 当前模型请求失败（stopReason 为 error）且不是 fallback 本身：提供切换到 fallback
- * - /route [status|handoff|new|confirm on|confirm off]（status 含确认超时秒数）
- * - 前缀：@代号 指定首条消息模型（代号见配置 models）；>> 强制当作新任务（herdr 开窗，否则窗口内）
+ * - /route [status|handoff|new [-c]|confirm on|confirm off]（status 含确认超时秒数）
+ * - 前缀：@代号 指定首条消息模型（代号见配置 models）；>> 强制当作新任务（herdr 开窗，否则窗口内）；>> 与 /route new 后接 -c / --current 使用当前模型
  *
  * 角色定义：由 inline-subagent/agents.ts 从 pi 配置目录下的 agents/*.md 读取；字段与含义沿用 pi-herdr-subagents（disable-model-invocation: true 的角色不列入分派策略；spawning: false 禁止继续分派）。task-router 不定义私有字段和特殊角色名。
  * 无关新任务（>>、/route new）：herdr 中写任务说明并用 handoff_open 开普通会话；否则窗口内执行
@@ -1020,13 +1020,20 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	function dispatchText(kind: string, original: string, suggestion?: string, mode?: DispatchMode): string {
-		const resolved = mode ?? defaultDispatchMode() ?? "inline";
-		const sug = suggestion ? `路由建议模型：${suggestion}；可根据上下文调整。` : "";
+	/** 解析新任务开头的 -c / --current：使用当前模型 */
+	function parseNewTask(raw: string): { task: string; useCurrent: boolean } {
+		const m = raw.match(/^(?:-c|--current)(?:\s+|$)/);
+		return m ? { task: raw.slice(m[0].length).trim(), useCurrent: true } : { task: raw, useCurrent: false };
+	}
+
+	function dispatchText(kind: string, original: string, mode: DispatchMode, ctx: ExtensionContext, useCurrent = false): string {
+		const cur = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+		const lv = ctx.thinkingLevel ?? pi.getThinkingLevel();
+		const pin = useCurrent && cur;
 		const how =
-			resolved === "handoff"
-				? `写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（背景、目标、相关文件、验收标准、「第一步」），再调用 handoff_open（file、model、thinking，model 和 thinking 按任务难度选）。新窗口是普通会话，结果不回传。${sug}`
-				: `调用 subagent_inline 在窗口内同步执行（${(IN_HERDR ? INLINE_ROLES : DISPATCH_ROLES).join(" / ") || DISPATCH_ROLES.join(" / ") || "（无）"}）。${sug}`;
+			mode === "handoff"
+				? `写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（背景、目标、相关文件、验收标准、「第一步」），再调用 handoff_open（${pin ? `file；不传 model、thinking，沿用当前模型 ${cur} 和思考等级` : "file、model、thinking，model 和 thinking 按任务难度选"}）。新窗口是普通会话，结果不回传。`
+				: `调用 subagent_inline 在窗口内同步执行（${(IN_HERDR ? INLINE_ROLES : DISPATCH_ROLES).join(" / ") || DISPATCH_ROLES.join(" / ") || "（无）"}）。${pin ? `model 传 "${cur}"，thinking 传 "${lv}"（用户要求使用当前模型）。` : ""}`;
 		return `[task-router] 用户提出了下面这个应分派出去的${kind}。不要在本会话中执行它。结合当前会话上下文写一份自包含的任务提示词，${how}\n\n用户原话：\n${original}`;
 	}
 
@@ -1053,13 +1060,13 @@ export default function (pi: ExtensionAPI) {
 		const hasUser = msgs.some((m) => m.role === "user");
 
 		if (text.startsWith(">>")) {
-			const task = text.slice(2).trim();
+			const { task, useCurrent } = parseNewTask(text.slice(2).trim());
 			const mode = defaultDispatchMode();
 			if (!mode) {
 				if (ctx.hasUI) ctx.ui.notify("交接与窗口内子代理均已关闭，已在本会话处理", "warning");
 				return task ? { action: "transform", text: task } : { action: "handled" };
 			}
-			return { action: "transform", text: dispatchText("新任务", task, undefined, mode) };
+			return { action: "transform", text: dispatchText("新任务", task, mode, ctx, useCurrent) };
 		}
 
 		// 首条消息：@代号 手动指定模型
@@ -1272,7 +1279,7 @@ export default function (pi: ExtensionAPI) {
 
 	// /route 命令
 	pi.registerCommand("route", {
-		description: "task-router：status | handoff [说明] | new <任务> | confirm on|off",
+		description: "task-router：status | handoff [说明] | new [-c] <任务> | confirm on|off",
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			const extra = rest.join(" ");
@@ -1303,10 +1310,11 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				case "new": {
-					if (!extra) return ctx.ui.notify("用法：/route new <任务>", "warning");
+					const { task, useCurrent } = parseNewTask(extra);
+					if (!task) return ctx.ui.notify("用法：/route new [-c] <任务>（-c 使用当前模型）", "warning");
 					const mode = defaultDispatchMode();
 					if (!mode) return ctx.ui.notify("交接与窗口内子代理均已关闭，/route new 不可用", "warning");
-					pi.sendUserMessage(dispatchText("新任务", extra, undefined, mode));
+					pi.sendUserMessage(dispatchText("新任务", task, mode, ctx, useCurrent));
 					return;
 				}
 				case "confirm":
