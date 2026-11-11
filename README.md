@@ -37,7 +37,7 @@
 |---|---|
 | `subagent_inline` | 窗口内同步执行角色任务（单个或 `tasks` 并行），结果直接返回 |
 | `subagent` | 开新 herdr 窗口执行角色任务（pi-herdr-subagents 提供），完成后结果回传 |
-| `handoff_open` | 读取 `~/.pi/agent/handoff/` 下的说明文件，在新 tab 开普通 pi 会话，结果不回传（仅 herdr 中注册）。`model`、`thinking` 可省略，省略时沿用当前会话的模型和思考等级 |
+| `handoff_open` | 读取 `~/.pi/agent/handoff/` 下的说明文件，在新 tab 开普通 pi 会话，结果不回传（仅 herdr 中注册）。新 tab 放在当前 tab 之后（同一窗口多次交接按 handoff[1]、[2]… 依次排列；herdr 不支持 `tab.move` 时留在末尾）。`model`、`thinking` 可省略，省略时沿用当前会话的模型和思考等级 |
 
 `subagent` / `subagent_inline` 调用前会弹出确认（`features.confirm`）：执行、查看或编辑任务、换模型（并行时为全部使用同一模型）、取消；超时按 `confirmTimeoutSec` / `dispatch.inlineConfirmTimeoutSec` 自动执行（编辑或换模型后不再自动执行），Esc 取消。
 

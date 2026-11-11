@@ -18,6 +18,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Type } from "typebox";
@@ -832,14 +833,88 @@ function nextHandoffTabLabel(): string {
 	}
 }
 
-function openHandoffSession(file: string, model: string, thinking: string, cwd: string): { tabId: string; paneId: string; agent: string } {
+/** herdr socket API 单次请求（CLI 没有的方法用它，如 tab.move）。按行分隔的 JSON；Windows 上 HERDR_SOCKET_PATH 为命名管道，net.connect 同样适用。 */
+function herdrSocketRequest(method: string, params: Record<string, unknown>, timeoutMs = 5_000): Promise<any> {
+	const socketPath = process.env.HERDR_SOCKET_PATH;
+	if (!socketPath) return Promise.reject(new Error("找不到 HERDR_SOCKET_PATH"));
+	const id = `task-router-${Date.now().toString(36)}`;
+	return new Promise((resolvePromise, reject) => {
+		let buf = "";
+		let settled = false;
+		const sock = connect(socketPath);
+		const finish = (err: Error | undefined, value?: any) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			sock.destroy();
+			if (err) reject(err);
+			else resolvePromise(value);
+		};
+		const timer = setTimeout(() => finish(new Error(`herdr ${method} 超时`)), timeoutMs);
+		sock.on("connect", () => sock.write(`${JSON.stringify({ id, method, params })}\n`));
+		sock.on("data", (chunk) => {
+			buf += chunk.toString("utf8");
+			let nl: number;
+			while ((nl = buf.indexOf("\n")) >= 0) {
+				const line = buf.slice(0, nl).trim();
+				buf = buf.slice(nl + 1);
+				if (!line) continue;
+				let msg: any;
+				try {
+					msg = JSON.parse(line);
+				} catch {
+					continue;
+				}
+				if (msg?.id !== id) continue;
+				if (msg.error) finish(new Error(`herdr ${method} 失败：${msg.error.message ?? msg.error.code}`));
+				else finish(undefined, msg.result);
+				return;
+			}
+		});
+		sock.on("error", (e) => finish(e));
+		sock.on("close", () => finish(new Error(`herdr ${method} 连接已关闭`)));
+	});
+}
+
+/**
+ * 交接窗口放到当前 tab 之后；跳过紧跟在后面、同一基名的已有交接 tab，保持 handoff[1]、[2]… 的顺序。
+ * tab.move 的 insert_index 是移动前列表中的插入位置。尽力而为，失败不影响交接。
+ */
+function handoffInsertIndex(tabs: Array<{ tab_id?: unknown; label?: unknown }>, currentTabId: string, newTabId: string, newLabel: string): number | undefined {
+	const cur = tabs.findIndex((t) => t?.tab_id === currentTabId);
+	if (cur < 0) return undefined;
+	const base = stripHandoffSuffix(newLabel);
+	const sibling = base ? new RegExp(`^${escapeRegExp(base)} handoff\\[\\d+\\]$`) : /^handoff\[\d+\]$/;
+	let j = cur + 1;
+	while (j < tabs.length && tabs[j]?.tab_id !== newTabId && typeof tabs[j]?.label === "string" && sibling.test(tabs[j].label as string)) j++;
+	if (tabs[j]?.tab_id === newTabId) return undefined;
+	return j;
+}
+
+async function moveHandoffTabAfterCurrent(ws: string, newTabId: string, newLabel: string): Promise<void> {
+	const currentTabId = process.env.HERDR_TAB_ID;
+	if (!currentTabId) return;
+	try {
+		const listed = await herdrSocketRequest("tab.list", { workspace_id: ws });
+		const tabs = Array.isArray(listed?.tabs) ? listed.tabs : [];
+		const idx = handoffInsertIndex(tabs, currentTabId, newTabId, newLabel);
+		if (idx === undefined) return;
+		await herdrSocketRequest("tab.move", { tab_id: newTabId, insert_index: idx });
+	} catch {
+		// 老版本 herdr 没有 tab.move，或 socket 不可用：保持在末尾
+	}
+}
+
+async function openHandoffSession(file: string, model: string, thinking: string, cwd: string): Promise<{ tabId: string; paneId: string; agent: string }> {
 	const ws = process.env.HERDR_WORKSPACE_ID;
 	if (!ws) throw new Error("找不到 HERDR_WORKSPACE_ID");
 	const filePrompt = toPromptPath(file);
-	const created = herdrJson(["tab", "create", "--workspace", ws, "--cwd", cwd, "--label", nextHandoffTabLabel(), "--focus"]);
+	const label = nextHandoffTabLabel();
+	const created = herdrJson(["tab", "create", "--workspace", ws, "--cwd", cwd, "--label", label, "--focus"]);
 	const tabId = created?.result?.tab?.tab_id;
 	const paneId = created?.result?.root_pane?.pane_id;
 	if (typeof tabId !== "string" || typeof paneId !== "string") throw new Error("herdr tab create 未返回 tab/pane id");
+	await moveHandoffTabAfterCurrent(ws, tabId, label);
 	const agent = `ho${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`.slice(0, 32);
 	try {
 		startHandoffPi(paneId, agent, model, thinking);
@@ -941,6 +1016,7 @@ function nextContextWarn(
 }
 
 export {
+	handoffInsertIndex,
 	createSerialQueue,
 	countRunningSubagents,
 	matchingPick,
@@ -982,7 +1058,7 @@ export default function (pi: ExtensionAPI) {
 				const model = params.model?.trim() || current;
 				const thinking = params.thinking?.trim() || ctx.thinkingLevel || pi.getThinkingLevel() || "medium";
 				if (!model) throw new Error("当前会话没有模型，需要显式传 model");
-				const opened = openHandoffSession(file, model, thinking, ctx.cwd);
+				const opened = await openHandoffSession(file, model, thinking, ctx.cwd);
 				return {
 					content: [{ type: "text", text: `已在新 tab 启动会话（${opened.tabId} / ${opened.agent}）。这是普通会话，结果不会回传。` }],
 					details: opened,
