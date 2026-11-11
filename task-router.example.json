@@ -40,6 +40,5 @@
 		"inlineSubagent": true,
 		"handoff": true
 	},
-	"policyFile": "~/.pi/agent/task-router.policy.md",
 	"policyAppend": ""
 }

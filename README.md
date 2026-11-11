@@ -17,7 +17,7 @@
 | 命令 | 作用 |
 |---|---|
 | `/route` 或 `/route status` | 显示当前模型、上下文用量、配置文件、分派确认开关、herdr 状态、各角色的执行方式（窗口内 / 新窗口）、功能开关、行为规则与子代理约定文件，以及配置警告和启动检查结果。无法识别的子命令也显示状态 |
-| `/route handoff [说明]` | 把当前任务交接到新窗口：让当前 agent 写交接说明到 `~/.pi/agent/handoff/<名称>-<日期时间>.md`（目标、进度、关键决定、相关文件、未完成步骤、注意事项、「第一步」），再用 `handoff_open` 开普通会话接手，默认沿用当前模型和思考等级（`说明` 里指定了模型时按指定）。`说明` 会作为补充要求附上。还有未完成的子窗口时先询问等待还是强制交接；交接成功后询问是否关闭本窗口（`features.handoffAutoClose`）。不在 herdr 中时只输出交接提示词。`features.handoff=false` 时不可用 |
+| `/route handoff [说明]` | 把当前任务交接到新窗口：让当前 agent 写交接说明到 `~/.pi/agent/task-router/handoff/<名称>-<日期时间>.md`（目标、进度、关键决定、相关文件、未完成步骤、注意事项、「第一步」），再用 `handoff_open` 开普通会话接手，默认沿用当前模型和思考等级（`说明` 里指定了模型时按指定）。`说明` 会作为补充要求附上。还有未完成的子窗口时先询问等待还是强制交接；交接成功后询问是否关闭本窗口（`features.handoffAutoClose`）。不在 herdr 中时只输出交接提示词。`features.handoff=false` 时不可用 |
 | `/route new [-c] <任务>` | 把一个与当前会话无关的新任务分派出去，不在本会话执行：herdr 中写任务说明并用 `handoff_open` 开普通会话；否则用 `subagent_inline` 窗口内执行。默认由 agent 按任务难度选模型；加 `-c`（或 `--current`）则使用当前模型和思考等级 |
 | `/route confirm on` / `/route confirm off` | 本次运行中开 / 关分派前确认（初始值为 `features.confirm`）。`/route confirm` 不带参数等同 `on` |
 
@@ -37,7 +37,7 @@
 |---|---|
 | `subagent_inline` | 窗口内同步执行角色任务（单个或 `tasks` 并行），结果直接返回 |
 | `subagent` | 开新 herdr 窗口执行角色任务（pi-herdr-subagents 提供），完成后结果回传 |
-| `handoff_open` | 读取 `~/.pi/agent/handoff/` 下的说明文件，在新 tab 开普通 pi 会话，结果不回传（仅 herdr 中注册）。新 tab 放在当前 tab 之后（同一窗口多次交接按 handoff[1]、[2]… 依次排列；herdr 不支持 `tab.move` 时留在末尾）。`model`、`thinking` 可省略，省略时沿用当前会话的模型和思考等级 |
+| `handoff_open` | 读取 `~/.pi/agent/task-router/handoff/` 下的说明文件，在新 tab 开普通 pi 会话，结果不回传（仅 herdr 中注册）。新 tab 放在当前 tab 之后（同一窗口多次交接按 handoff[1]、[2]… 依次排列；herdr 不支持 `tab.move` 时留在末尾）。`model`、`thinking` 可省略，省略时沿用当前会话的模型和思考等级 |
 
 `subagent` / `subagent_inline` 调用前会弹出确认（`features.confirm`）：执行、查看或编辑任务、换模型（并行时为全部使用同一模型）、取消；超时按 `confirmTimeoutSec` / `dispatch.inlineConfirmTimeoutSec` 自动执行（编辑或换模型后不再自动执行），Esc 取消。
 
@@ -59,12 +59,12 @@ pi install git:github.com/Jayna97/pi-task-router
 
 安装时请检查 herdr 与 pi-herdr-subagents 是否已安装；缺失时告诉用户会失去哪些功能（见[不在 herdr 中运行时](#不在-herdr-中运行时)），并询问是否安装。
 
-包会被克隆到 pi 配置目录下的 `git/github.com/Jayna97/pi-task-router`。pi 配置目录默认是 `~/.pi/agent`，设置了 `PI_CODING_AGENT_DIR` 时跟随该变量（配置文件、角色、handoff 均在此目录下）。下文的 `~/.pi/agent/...` 均指该目录。不要再把扩展文件另外放进 `~/.pi/agent/extensions/`，否则会重复注册工具。
+包会被克隆到 pi 配置目录下的 `git/github.com/Jayna97/pi-task-router`。pi 配置目录默认是 `~/.pi/agent`，设置了 `PI_CODING_AGENT_DIR` 时跟随该变量（角色在其下的 `agents/`，task-router 自己的配置、规则文件和交接说明都在其下的 `task-router/`）。下文的 `~/.pi/agent/...` 均指该目录。不要再把扩展文件另外放进 `~/.pi/agent/extensions/`，否则会重复注册工具。
 
 ### 用法一：直接用自带角色和示例配置
 
 1. 把包里 `agents/` 下的两个角色文件**复制**到 `~/.pi/agent/agents/`（已有同名文件时自行合并）。不要用软链接：`pi update` 会重置克隆目录，`pi remove` 会删除克隆目录。
-2. 把 `task-router.example.json` 复制为 `~/.pi/agent/task-router.json`。
+2. 把 `task-router.example.json` 复制为 `~/.pi/agent/task-router/config.json`。
 3. 把模型换成你有凭据的模型：配置中的 `models`，以及 `verifier.md`、`chore.md` frontmatter 中的 `model`（`provider/id`）。
 
 ### 用法二：用自己的角色
@@ -99,7 +99,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 
 正文是该角色的系统提示词，窗口内执行时追加在 pi 默认系统提示词之后。正文可以为空。
 
-角色说明只以角色文件为准。`task-router.json` 中与角色相关的配置只有：
+角色说明只以角色文件为准。`config.json` 中与角色相关的配置只有：
 
 - `dispatch.inlineRoles` 列出在 herdr 中也走窗口内执行的角色，其余可分派角色开新窗口。
 
@@ -107,7 +107,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 
 ### 配置字段
 
-配置文件为 `~/.pi/agent/task-router.json`，字段如下：
+配置文件为 `~/.pi/agent/task-router/config.json`，字段如下：
 
 | 字段 | 含义 |
 |---|---|
@@ -118,7 +118,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 | `dispatch.inlineRoles` | 在 herdr 中也走 `subagent_inline` 的角色 |
 | `dispatch.inlineConfirmTimeoutSec` | 窗口内分派确认的自动执行秒数，`0` 关闭 |
 | `features` | 功能开关，均为可选布尔值，缺省 `true`。见下文 |
-| `policyFile` | 可选，行为规则 markdown 路径（支持 `~`），缺省 `<pi 配置目录>/task-router.policy.md` |
+| `policyFile` | 可选，行为规则 markdown 路径（支持 `~`），缺省 `<pi 配置目录>/task-router/policy.md` |
 | `policyAppend` | 可选，追加到分派规则末尾的文字 |
 
 配置完成后启动 `pi`，用 `/route status` 确认配置已加载。
@@ -145,13 +145,13 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 - **事实**（代码生成）：可用模型表、当前环境下可用的工具与角色（受 herdr 和 `features` 影响）、交接目录与写法。
 - **行为规则**（外部 markdown）：何时使用/不使用子代理、并行结果如何处理、用户说「在这里做」时照做、方案代价说明等。
 
-默认读取 `<pi 配置目录>/task-router.policy.md`（可用 `policyFile` 覆盖，支持 `~`）。文件存在则用其内容；不存在或读取失败则用内置默认，并给出 warning，分派规则照常注入。规则文件支持占位符 `{{handoffDir}}`，由代码替换。`policyAppend` 仍追加在末尾。
+默认读取 `<pi 配置目录>/task-router/policy.md`（可用 `policyFile` 覆盖，支持 `~`）。文件存在则用其内容；不存在或读取失败则用内置默认，并给出 warning，分派规则照常注入。规则文件支持占位符 `{{handoffDir}}`，由代码替换。`policyAppend` 仍追加在末尾。
 
-仓库中的 `task-router.policy.example.md` 与内置默认相同。扩展在配置目录尚无该文件时会写入一份，方便直接改。
+仓库中的 `task-router.policy.example.md` 与内置默认相同。扩展在 `task-router/` 下尚无该文件时会写入一份，方便直接改。
 
 ### 子代理约定
 
-被分派的子代理（开新窗口或窗口内，与 `spawning` 无关；`handoff_open` 开的是普通会话，不注入）启动时，注入 `<pi 配置目录>/task-router.worker.md`：只依据任务提示词、不扩大范围、有歧义时询问、资源安全规则、默认汇报格式（角色另有格式时以角色为准）。占位符 `{{ask}}` 按执行方式替换：开新窗口为“用 caller_ping 询问调用方”，窗口内为“停止执行并在汇报中说明”。
+被分派的子代理（开新窗口或窗口内，与 `spawning` 无关；`handoff_open` 开的是普通会话，不注入）启动时，注入 `<pi 配置目录>/task-router/worker.md`：只依据任务提示词、不扩大范围、有歧义时询问、资源安全规则、默认汇报格式（角色另有格式时以角色为准）。占位符 `{{ask}}` 按执行方式替换：开新窗口为“用 caller_ping 询问调用方”，窗口内为“停止执行并在汇报中说明”。
 
 文件不存在时写入内置默认，读取失败时回退内置默认并给出 warning。配置无效（不注入分派规则）时仍然注入。
 
@@ -172,7 +172,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 ## 更新与卸载
 
 - 更新：`pi update git:github.com/Jayna97/pi-task-router`。只更新扩展代码，已复制的角色文件不会变，需要时自行对比合并。
-- 卸载：`pi remove git:github.com/Jayna97/pi-task-router`，再删除 `~/.pi/agent/agents/` 中属于本包的角色文件（注意不要误删自己写的同名角色），以及可选的 `~/.pi/agent/task-router.json`。
+- 卸载：`pi remove git:github.com/Jayna97/pi-task-router`，再删除 `~/.pi/agent/agents/` 中属于本包的角色文件（注意不要误删自己写的同名角色），以及 `~/.pi/agent/task-router/` 目录（配置、规则文件和交接说明）。
 
 ## 项目结构
 

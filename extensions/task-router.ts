@@ -1,7 +1,7 @@
 /**
  * task-router — 分派策略、分派确认与交接（新窗口执行层由 pi-herdr-subagents 负责）
  *
- * - 配置：只读 pi 配置目录（getAgentDir()）下的 task-router.json；读取或校验失败时不注入分派规则，session_start 提示错误
+ * - 配置：只读 <agentDir>/task-router/config.json；读取或校验失败时不注入分派规则，session_start 提示错误
  * - 不自动选模型、不判断消息；只有用户主动用 >>、/route new 或在消息中明确要求时才分派
  * - 拦截 subagent / subagent_inline：确认 / 编辑任务 / 换模型 / 取消（超时自动执行，0 关闭）
  * - auto-exit 与 interactive 只对新窗口执行（subagent）生效；窗口内执行不读这两项
@@ -13,14 +13,14 @@
  * 角色定义：由 inline-subagent/agents.ts 从 pi 配置目录下的 agents/*.md 读取；字段与含义沿用 pi-herdr-subagents（disable-model-invocation: true 的角色不列入分派策略；spawning: false 禁止继续分派）。task-router 不定义私有字段和特殊角色名。
  * 无关新任务（>>、/route new）：herdr 中写任务说明并用 handoff_open 开普通会话；否则窗口内执行
  * features：confirm / contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
- * policyFile：行为规则 markdown（缺省 <agentDir>/task-router.policy.md）；policyAppend 追加到末尾
+ * policyFile：行为规则 markdown（缺省 <agentDir>/task-router/policy.md）；policyAppend 追加到末尾
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Type } from "typebox";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -54,7 +54,7 @@ function sleepSync(ms: number): void {
 }
 
 // ───────────────────────── 配置 ─────────────────────────
-// 只读 pi 配置目录（getAgentDir()）下的 task-router.json，不做内置默认深合并。代号限 [a-z][a-z0-9_-]*
+// 只读 <agentDir>/task-router/config.json，不做内置默认深合并。代号限 [a-z][a-z0-9_-]*
 // confirmTimeoutSec：分派确认框首次弹出后的自动执行秒数（缺省 30；0 关闭；Esc 仍拦截）
 // 角色说明只以角色文件为准（roles 已废弃，写了会被忽略并警告）
 // features：confirm / contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
@@ -94,13 +94,15 @@ const FEATURE_KEYS: FeatureKey[] = [
 	"inlineSubagent",
 	"handoff",
 ];
-const DEFAULT_POLICY_PATH = join(getAgentDir(), "task-router.policy.md");
+/** task-router 自己的文件都放在 <agentDir>/task-router/ 下；角色目录 agents/ 与 pi-herdr-subagents 共用，仍在 <agentDir> 下 */
+const ROUTER_DIR = join(getAgentDir(), "task-router");
+const DEFAULT_POLICY_PATH = join(ROUTER_DIR, "policy.md");
 /** 子代理通用约定（固定路径，缺失时写入内置默认） */
-const WORKER_POLICY_PATH = join(getAgentDir(), "task-router.worker.md");
+const WORKER_POLICY_PATH = join(ROUTER_DIR, "worker.md");
 
-const CONFIG_PATH = join(getAgentDir(), "task-router.json");
-const CLOSE_LOG_PATH = join(getAgentDir(), "task-router-close.log");
-const HANDOFF_DIR = join(getAgentDir(), "handoff");
+const CONFIG_PATH = join(ROUTER_DIR, "config.json");
+const CLOSE_LOG_PATH = join(ROUTER_DIR, "close.log");
+const HANDOFF_DIR = join(ROUTER_DIR, "handoff");
 /** 给人/模型看：正斜杠，避免 JSON 把 Windows 路径里的 \t 等当成转义。 */
 const HANDOFF_DIR_PROMPT = HANDOFF_DIR.replaceAll("\\", "/");
 const PICK_NAME_RE = /^[a-z][a-z0-9_-]*$/;
@@ -514,6 +516,7 @@ function applyPolicyPlaceholders(text: string): string {
 function ensureDefaultFile(path: string, content: string, label: string): string | undefined {
 	if (existsSync(path)) return undefined;
 	try {
+		mkdirSync(dirname(path), { recursive: true });
 		writeFileSync(path, content, "utf8");
 		return undefined;
 	} catch (e: any) {
