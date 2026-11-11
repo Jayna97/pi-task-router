@@ -1,5 +1,5 @@
 /**
- * task-router — 会话级模型选择 + 分派策略（执行层由 pi-herdr-subagents 负责）
+ * task-router — 分派策略、分派确认与交接（新窗口执行层由 pi-herdr-subagents 负责）
  *
  * - 配置：只读 pi 配置目录（getAgentDir()）下的 task-router.json；读取或校验失败时暂停自动路由（不注入分派策略），session_start 提示错误
  * - 不自动选模型、不判断消息；只有用户主动用 >>、/route new 或在消息中明确要求时才分派
@@ -728,8 +728,9 @@ function resolveHandoffFile(file: string): string {
 	return resolved;
 }
 
+/** 白名单：Windows 上 model/thinking 会拼进 PowerShell 命令行（`;`、`$`、反引号、空格等都可能改变命令）。 */
 function assertHandoffArg(value: string, label: string): void {
-	if (/[\r\n"&|<>^%]/.test(value)) throw new Error(`${label} 含非法字符`);
+	if (!/^[A-Za-z0-9._:/@+\[\]-]+$/.test(value)) throw new Error(`${label} 含非法字符：${value}`);
 }
 
 function paneHasAgent(paneId: string): boolean {
@@ -1094,10 +1095,14 @@ export default function (pi: ExtensionAPI) {
 
 		if (text.startsWith(">>")) {
 			const { task, useCurrent } = parseNewTask(text.slice(2).trim());
+			if (!task) {
+				ctx.ui.notify("用法：>> [-c] <任务>（-c 使用当前模型）", "warning");
+				return { action: "handled" };
+			}
 			const mode = defaultDispatchMode();
 			if (!mode) {
 				if (ctx.hasUI) ctx.ui.notify("交接与窗口内子代理均已关闭，已在本会话处理", "warning");
-				return task ? { action: "transform", text: task } : { action: "handled" };
+				return { action: "transform", text: task };
 			}
 			return { action: "transform", text: dispatchText("新任务", task, mode, ctx, useCurrent) };
 		}

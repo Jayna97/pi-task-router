@@ -1,7 +1,7 @@
 {
   "name": "pi-task-router",
   "version": "0.1.2",
-  "description": "Pi coding agent package: session-level model routing and subagent dispatch policy, plus in-window subagent_inline.",
+  "description": "Pi coding agent package: subagent dispatch policy and confirmation, handoff to new herdr tabs, plus in-window subagent_inline.",
   "keywords": ["pi-package"],
   "license": "MIT",
   "type": "module",
