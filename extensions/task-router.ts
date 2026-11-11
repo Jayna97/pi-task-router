@@ -605,7 +605,7 @@ function buildFacts(herdr: boolean, features: Features = FEATURES): string {
 
 	if (handoffOn && herdr) {
 		sections.push(
-			`交接当前任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file、model、thinking）。新窗口是普通会话，结果不回传。交接默认沿用当前模型。\n- 与主题无关的新任务同样用这种方式在新窗口开普通会话：说明里写任务本身（背景、目标、相关文件、验收标准、「第一步」），model 和 thinking 按任务难度选。`,
+			`交接当前任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file；省略 model、thinking 即沿用当前模型和思考等级，用户指定了模型时才传）。新窗口是普通会话，结果不回传。\n- 与主题无关的新任务同样用这种方式在新窗口开普通会话：说明里写任务本身（背景、目标、相关文件、验收标准、「第一步」），model 和 thinking 按任务难度选。`,
 		);
 	} else if (handoffOn) {
 		sections.push(
@@ -966,20 +966,21 @@ export default function (pi: ExtensionAPI) {
 			name: "handoff_open",
 			label: "交接开窗",
 			description:
-				`读取 ${HANDOFF_DIR_PROMPT}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 PI_SUBAGENT_* / PI_INLINE_*，不受子代理监视、不回传）。参数：file、model（provider/id）、thinking。`,
+				`读取 ${HANDOFF_DIR_PROMPT}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 PI_SUBAGENT_* / PI_INLINE_*，不受子代理监视、不回传）。参数：file；model（provider/id）、thinking 可省略，省略时沿用当前会话的模型和思考等级。`,
 			promptSnippet: `把交接说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md 后调用，开新 tab 接手。`,
 			parameters: Type.Object({
 				file: Type.String({ description: `交接文件路径，必须在 ${HANDOFF_DIR_PROMPT}/ 下` }),
-				model: Type.String({ description: "新会话模型，provider/id" }),
-				thinking: Type.String({ description: "思考等级，如 low|medium|high" }),
+				model: Type.Optional(Type.String({ description: "新会话模型，provider/id；省略则沿用当前模型" })),
+				thinking: Type.Optional(Type.String({ description: "思考等级，如 low|medium|high；省略则沿用当前思考等级" })),
 			}),
 			executionMode: "sequential",
 			async execute(_id, params, _signal, _onUpdate, ctx) {
 				if (IS_WORKER) throw new Error("当前角色不允许交接");
 				const file = resolveHandoffFile(params.file);
-				const model = params.model.trim();
-				const thinking = params.thinking.trim();
-				if (!model || !thinking) throw new Error("model 和 thinking 不能为空");
+				const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+				const model = params.model?.trim() || current;
+				const thinking = params.thinking?.trim() || ctx.thinkingLevel || pi.getThinkingLevel() || "medium";
+				if (!model) throw new Error("当前会话没有模型，需要显式传 model");
 				const opened = openHandoffSession(file, model, thinking, ctx.cwd);
 				return {
 					content: [{ type: "text", text: `已在新 tab 启动会话（${opened.tabId} / ${opened.agent}）。这是普通会话，结果不会回传。` }],
@@ -1296,7 +1297,7 @@ export default function (pi: ExtensionAPI) {
 					pi.sendUserMessage(
 						`[task-router] 把当前任务交接到新窗口。写一份自包含的交接说明到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md：目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」（告诉新会话先做什么）；丢弃已过时或无关的内容。${
 							IN_HERDR
-								? `然后调用 handoff_open（file: 该文件路径，model: "${current}"，thinking: "${ctx.thinkingLevel ?? "medium"}"，除非剩余工作明显更适合其他模型）。`
+								? `然后调用 handoff_open（file: 该文件路径；不传 model、thinking，沿用当前模型 ${current} 和思考等级${extra ? "，除非用户补充里指定了模型" : ""}）。`
 								: "然后把提示词完整输出给用户，建议用户在新会话中继续。"
 						}${extra ? `\n用户补充：${extra}` : ""}`,
 					);

@@ -17,7 +17,7 @@
 | 命令 | 作用 |
 |---|---|
 | `/route` 或 `/route status` | 显示当前模型、上下文用量、配置文件、分派确认开关、herdr 状态、各角色的执行方式（窗口内 / 新窗口）、功能开关、行为规则与子代理约定文件，以及配置警告和启动检查结果。无法识别的子命令也显示状态 |
-| `/route handoff [说明]` | 把当前任务交接到新窗口：让当前 agent 写交接说明到 `~/.pi/agent/handoff/<名称>-<日期时间>.md`（目标、进度、关键决定、相关文件、未完成步骤、注意事项、「第一步」），再用 `handoff_open` 以当前模型和思考等级开普通会话接手。`说明` 会作为补充要求附上。还有未完成的子窗口时先询问等待还是强制交接；交接成功后询问是否关闭本窗口（`features.handoffAutoClose`）。不在 herdr 中时只输出交接提示词。`features.handoff=false` 时不可用 |
+| `/route handoff [说明]` | 把当前任务交接到新窗口：让当前 agent 写交接说明到 `~/.pi/agent/handoff/<名称>-<日期时间>.md`（目标、进度、关键决定、相关文件、未完成步骤、注意事项、「第一步」），再用 `handoff_open` 开普通会话接手，默认沿用当前模型和思考等级（`说明` 里指定了模型时按指定）。`说明` 会作为补充要求附上。还有未完成的子窗口时先询问等待还是强制交接；交接成功后询问是否关闭本窗口（`features.handoffAutoClose`）。不在 herdr 中时只输出交接提示词。`features.handoff=false` 时不可用 |
 | `/route new <任务>` | 把一个与当前会话无关的新任务分派出去，不在本会话执行：herdr 中写任务说明并用 `handoff_open` 开普通会话；否则用 `subagent_inline` 窗口内执行 |
 | `/route confirm on` / `/route confirm off` | 本次运行中开 / 关分派前确认（初始值为 `features.confirm`）。`/route confirm` 不带参数等同 `on` |
 
@@ -36,7 +36,7 @@
 |---|---|
 | `subagent_inline` | 窗口内同步执行角色任务（单个或 `tasks` 并行），结果直接返回 |
 | `subagent` | 开新 herdr 窗口执行角色任务（pi-herdr-subagents 提供），完成后结果回传 |
-| `handoff_open` | 读取 `~/.pi/agent/handoff/` 下的说明文件，在新 tab 开普通 pi 会话，结果不回传（仅 herdr 中注册） |
+| `handoff_open` | 读取 `~/.pi/agent/handoff/` 下的说明文件，在新 tab 开普通 pi 会话，结果不回传（仅 herdr 中注册）。`model`、`thinking` 可省略，省略时沿用当前会话的模型和思考等级 |
 
 `subagent` / `subagent_inline` 调用前会弹出确认（`features.confirm`）：执行、查看或编辑任务、换模型（并行时为全部使用同一模型）、取消；超时按 `confirmTimeoutSec` / `dispatch.inlineConfirmTimeoutSec` 自动执行（编辑或换模型后不再自动执行），Esc 取消。
 
