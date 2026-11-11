@@ -1,7 +1,7 @@
 /**
  * task-router — 分派策略、分派确认与交接（新窗口执行层由 pi-herdr-subagents 负责）
  *
- * - 配置：只读 pi 配置目录（getAgentDir()）下的 task-router.json；读取或校验失败时暂停自动路由（不注入分派策略），session_start 提示错误
+ * - 配置：只读 pi 配置目录（getAgentDir()）下的 task-router.json；读取或校验失败时不注入分派规则，session_start 提示错误
  * - 不自动选模型、不判断消息；只有用户主动用 >>、/route new 或在消息中明确要求时才分派
  * - 拦截 subagent / subagent_inline：确认 / 编辑任务 / 换模型 / 取消（超时自动执行，0 关闭）
  * - auto-exit 与 interactive 只对新窗口执行（subagent）生效；窗口内执行不读这两项
@@ -233,7 +233,7 @@ function joinWarnings(...parts: Array<string | undefined>): string | undefined {
 	return s || undefined;
 }
 
-/** 配置不可用时的空壳：不自动路由；确认仍开但超时为 0（不自动执行）。 */
+/** 配置不可用时的空壳：不注入分派规则；确认仍开但超时为 0（不自动执行）。 */
 function pausedConfig(): RouterConfig {
 	return {
 		models: {},
@@ -259,7 +259,7 @@ function loadConfig(): { cfg: RouterConfig; paused: boolean; warning?: string } 
 	const pause = (msg: string) => ({
 		cfg: pausedConfig(),
 		paused: true,
-		warning: joinWarnings(`${msg}。已暂停自动路由（不注入分派策略）`, agentWarn),
+		warning: joinWarnings(`${msg}。已停止注入分派规则`, agentWarn),
 	});
 	if (!existsSync(CONFIG_PATH)) return pause(`${CONFIG_PATH} 不存在`);
 	let text: string;
@@ -1439,7 +1439,7 @@ export default function (pi: ExtensionAPI) {
 										? `窗口内子代理：${INLINE_AGENT || "（无）"}`
 										: "",
 							`上下文：${u?.tokens ?? "?"} tokens（${u?.percent != null ? Math.round(u.percent) : "?"}%）`,
-							`配置：${ROUTING_PAUSED ? "已暂停（读取/校验失败）" : CONFIG_PATH}`,
+							`配置：${ROUTING_PAUSED ? "读取/校验失败，未注入分派规则" : CONFIG_PATH}`,
 							`分派确认：${confirmOn ? "开" : "关"} ｜ herdr：${IN_HERDR ? "是" : "否"}`,
 							piVersionStatusLine(),
 							IN_HERDR

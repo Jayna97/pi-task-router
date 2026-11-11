@@ -125,7 +125,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 
 ### features
 
-写在 `features` 对象下，全部可选，缺省 `true`。旧配置不写新键时仍正常加载，不会因此暂停路由。
+写在 `features` 对象下，全部可选，缺省 `true`。旧配置不写新键时仍正常加载。
 
 | 键 | 作用 |
 |---|---|
@@ -145,7 +145,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 - **事实**（代码生成）：可用模型表、当前环境下可用的工具与角色（受 herdr 和 `features` 影响）、交接目录与写法。
 - **行为规则**（外部 markdown）：何时使用/不使用子代理、并行结果如何处理、用户说「在这里做」时照做、方案代价说明等。
 
-默认读取 `<pi 配置目录>/task-router.policy.md`（可用 `policyFile` 覆盖，支持 `~`）。文件存在则用其内容；不存在或读取失败则用内置默认，并给出 warning，不暂停路由。规则文件支持占位符 `{{handoffDir}}`，由代码替换。`policyAppend` 仍追加在末尾。
+默认读取 `<pi 配置目录>/task-router.policy.md`（可用 `policyFile` 覆盖，支持 `~`）。文件存在则用其内容；不存在或读取失败则用内置默认，并给出 warning，分派规则照常注入。规则文件支持占位符 `{{handoffDir}}`，由代码替换。`policyAppend` 仍追加在末尾。
 
 仓库中的 `task-router.policy.example.md` 与内置默认相同。扩展在配置目录尚无该文件时会写入一份，方便直接改。
 
@@ -153,7 +153,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 
 被分派的子代理（开新窗口或窗口内，与 `spawning` 无关；`handoff_open` 开的是普通会话，不注入）启动时，注入 `<pi 配置目录>/task-router.worker.md`：只依据任务提示词、不扩大范围、有歧义时询问、资源安全规则、默认汇报格式（角色另有格式时以角色为准）。占位符 `{{ask}}` 按执行方式替换：开新窗口为“用 caller_ping 询问调用方”，窗口内为“停止执行并在汇报中说明”。
 
-文件不存在时写入内置默认，读取失败时回退内置默认并给出 warning。路由暂停时仍然注入。
+文件不存在时写入内置默认，读取失败时回退内置默认并给出 warning。配置无效（不注入分派规则）时仍然注入。
 
 ### 内置默认行为规则
 
@@ -196,5 +196,5 @@ pi-task-router/
 - **启动检查**：每个会话提示一次。pi 低于 1.3.0 时提示升级；在 herdr 中但没有 `subagent` 工具时，提示安装 pi-herdr-subagents 或把可分派角色写入 `dispatch.inlineRoles`；Windows 上在 herdr 中但 PATH 里没有 bash 时，提示加入 Git Bash 的 `bin` 目录。不在 herdr 中时不做 herdr 相关提示。`/route status` 会显示这些检查结果。Windows 上 `handoff_open` 用 `pi.cmd` 启动，不走 herdr `agent start --kind pi`（后者会打到 npm 无扩展脚本）。推理模型若当前思考档是 `off`（从非推理模型切过来，或中继未声明 thinkingLevelMap），会抬到 `medium`。
 - **请求失败切 fallback**：当前模型请求失败且不是 fallback 模型时，提示切换到 `fallback`。
 - **上下文过长提醒**：超过 `contextWarn` 阈值时提示用 `/route handoff` 写交接说明并在新窗口接手，每项每会话只提醒一次。
-- **配置无效时**：缺少配置文件、JSON 无效或校验失败时暂停自动路由（不注入分派策略），启动时提示错误；分派确认仍生效，但不会超时自动执行。
+- **配置无效时**：缺少配置文件、JSON 无效或校验失败时不注入分派规则，启动时提示错误；分派确认仍生效，但不会超时自动执行。
 - **统计未完成子窗口**：`/route handoff` 和上下文提醒前会读取 pi-herdr-subagents 的内部运行状态，统计本会话派生的未完成子窗口。这不是公开 API，读不到时按 0 处理，不拦截交接。
