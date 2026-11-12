@@ -1083,6 +1083,18 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	pi.registerTool({
+		name: "context_usage",
+		label: "上下文用量",
+		description: "只读：返回当前会话的上下文 token 估计、上下文窗口大小与占用百分比。tokens 为 null 表示暂不可知（如刚压缩后）。",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const u = ctx.getContextUsage();
+			const data = { tokens: u?.tokens ?? null, contextWindow: u?.contextWindow ?? null, percent: u?.percent ?? null };
+			return { content: [{ type: "text", text: JSON.stringify(data) }], details: data };
+		},
+	});
+
 	pi.on("session_start", (_event, ctx) => {
 		ensureThinkingOn(pi, ctx);
 		deactivateBlockedTools(pi);
