@@ -5,10 +5,10 @@
  * - 不自动选模型、不判断消息；只有用户主动用 >>、>>>、/route new 或在消息中明确要求时才分派
  * - 拦截 subagent / subagent_inline：确认 / 编辑任务 / 换模型 / 取消（超时自动执行，0 关闭）
  * - auto-exit 与 interactive 只对新窗口执行（subagent）生效；窗口内执行不读这两项
- * - 上下文过长：优先提醒 /compact 压缩
+ * - 上下文过长：提醒按需交接或手动压缩
  * - 当前模型请求失败（stopReason 为 error）且不是 fallback 本身：提供切换到 fallback
  * - /route [status|handoff [说明]|new [-c]|confirm on|confirm off]（status 含确认超时秒数）
- * - 前缀：@代号 指定首条消息模型；<< 等同 /compact；<<< 等同 /route handoff；>> 开子代理，完成后关窗并回传；>>> 等同 /route new
+ * - 前缀：@代号 指定首条消息模型；<< 等同 /route handoff；>> 开子代理，完成后关窗并回传；>>> 等同 /route new
  *
  * 角色定义：由 inline-subagent/agents.ts 从 pi 配置目录下的 agents/*.md 读取；字段与含义沿用 pi-herdr-subagents（disable-model-invocation: true 的角色不列入分派策略；spawning: false 禁止继续分派）。task-router 不定义私有字段和特殊角色名。
  * 无关新任务（>>>、/route new）：herdr 中写任务说明并用 handoff_open 开普通会话；否则窗口内执行
@@ -1144,7 +1144,7 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	/** /route handoff 与 <<< 前缀共用：检查开关与未完成子任务，返回发给 agent 的交接指令；取消时返回 undefined */
+	/** /route handoff 与 << 前缀共用：检查开关与未完成子任务，返回发给 agent 的交接指令；取消时返回 undefined */
 	async function prepareHandoff(ctx: ExtensionContext, extra: string): Promise<string | undefined> {
 		if (!FEATURES.handoff) {
 			ctx.ui.notify("交接已关闭（features.handoff=false）", "warning");
@@ -1233,22 +1233,8 @@ export default function (pi: ExtensionAPI) {
 
 	// 输入拦截
 	pi.on("input", async (event, ctx) => {
-		if (IS_WORKER || event.source !== "interactive") return { action: "continue" };
+		if (IS_WORKER || event.source !== "interactive" || event.streamingBehavior) return { action: "continue" };
 		let text = event.text.trim();
-		if (/^<<(?!<)/.test(text)) {
-			if (event.streamingBehavior || !ctx.isIdle()) {
-				ctx.ui.notify("请等本轮结束后再压缩上下文", "warning");
-				return { action: "handled" };
-			}
-			ctx.ui.notify("正在压缩上下文…", "info");
-			ctx.compact({
-				customInstructions: text.slice(2).trim() || undefined,
-				onComplete: () => ctx.ui.notify("上下文压缩完成", "info"),
-				onError: (error) => ctx.ui.notify(`压缩上下文失败：${error.message}`, "error"),
-			});
-			return { action: "handled" };
-		}
-		if (event.streamingBehavior) return { action: "continue" };
 		if (!text || text.startsWith("/") || text.startsWith("!")) return { action: "continue" };
 		// Read-only catalog queries are handled by the proxy audit extension, not task routing.
 		if (/^(?:请)?(?:帮我)?(?:更新中转站|查询模型|查询中转站模型)[。！!？?\s]*$/.test(text)) return { action: "continue" };
@@ -1256,8 +1242,8 @@ export default function (pi: ExtensionAPI) {
 		const msgs = branchMessages(ctx);
 		const hasUser = msgs.some((m) => m.role === "user");
 
-		if (text.startsWith("<<<")) {
-			const msg = await prepareHandoff(ctx, text.slice(3).trim());
+		if (/^<<(?!<)/.test(text)) {
+			const msg = await prepareHandoff(ctx, text.slice(2).trim());
 			return msg ? { action: "transform", text: msg } : { action: "handled" };
 		}
 
@@ -1472,7 +1458,7 @@ export default function (pi: ExtensionAPI) {
 		const warn = nextContextWarn(sid, usage, userTurns, warned);
 		if (warn && countRunningSubagents() === 0) {
 			warned.add(warn.key);
-			ctx.ui.notify(`💡 ${warn.reason}。建议先用 /compact（<<）压缩上下文，在当前会话继续。`, "warning");
+			ctx.ui.notify(`💡 ${warn.reason}。需要换会话时用 <<（/route handoff）；只想腾空间且旧内容可以概括时，用 /compact。`, "warning");
 		}
 	});
 

@@ -1,6 +1,6 @@
 {
   "name": "pi-task-router",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Pi coding agent package: subagent dispatch policy and confirmation, handoff to new herdr tabs, plus in-window subagent_inline.",
   "keywords": ["pi-package"],
   "license": "MIT",

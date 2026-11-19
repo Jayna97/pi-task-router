@@ -12,7 +12,7 @@
 
 ## 命令与前缀
 
-**同一个任务继续做，优先用 `<<` 压缩上下文；只有明确想换一个干净会话时，才用 `<<<` 交接。** 如果是另起一个无关任务，用 `>>>`，它不会关闭当前会话。
+**上下文够用就直接继续。** 需要换会话接着做同一个任务，用 `<<` 交接；只想在当前会话腾空间、且较早的内容可以概括时，手动输入 Pi 的 `/compact [说明]`。另起无关任务用 `>>>`，不会关闭当前会话。
 
 ### `/route` 命令
 
@@ -27,11 +27,20 @@
 
 | 前缀 | 作用 |
 |---|---|
-| `<< [说明]` | 在当前轮结束后使用。调用 Pi 原生压缩，将较早的对话整理成摘要，保留近期消息，不开新窗口。可选说明用于指定摘要重点，例如 `<< 保留验收点和下一步` |
-| `<<< [说明]` | 与 `/route handoff [说明]` 相同。例如 `<<< 新会话先跑测试` |
+| `<< [说明]` | 与 `/route handoff [说明]` 相同。例如 `<< 原样附上最初需求，新会话先跑测试` |
 | `>> [-c] <任务>` | 在 herdr 中开一个一次性子代理窗口，完成后自动关窗并回传结果到当前会话。沿用分派确认和子代理默认配置，加 `-c` 使用当前模型和思考等级。例如 `>> 检查这次改动有没有遗漏` |
 | `>>> [-c] <任务>` | 与 `/route new [-c] <任务>` 相同，在 herdr 中开独立普通会话。例如 `>>> -c 整理下载目录` |
 | `@代号 <消息>` | 仅对会话首条消息有效：把本会话模型切换到配置 `models` 中的该代号（思考等级 `medium`），前缀会从消息中去掉。启动时带 `--model`、已用 `/model` 切换过的会话，以及子代理会话不处理该前缀 |
+
+#### `>>` 的子代理布局
+
+布局由 `pi-herdr-subagents` 控制。未设置 `PI_SUBAGENT_LAYOUT` 时，`>>` 默认开新 tab。若想用当前 tab 的右侧分屏，在 herdr 中启动 Pi 前执行：
+
+```sh
+export PI_SUBAGENT_LAYOUT=split
+```
+
+想在下方分屏，用 `PI_SUBAGENT_LAYOUT=split:down`。此设置需要在每台设备上单独配置，更新 task-router 不会改变默认布局。它也影响其他 `subagent` 调用，但 `<<` 交接和 `>>>` 新任务仍开普通 tab。
 
 ### 自然语言要求
 
@@ -43,7 +52,7 @@
 | `subagent` | 开新 herdr 窗口执行角色任务（pi-herdr-subagents 提供），完成后结果回传 |
 | `handoff_open` | 读取 `~/.pi/agent/task-router/handoff/` 下的说明文件，在新 tab 开普通 pi 会话，结果不回传（仅 herdr 中注册）。新 tab 放在当前 tab 之后（同一窗口多次交接按 [1]、[2]… 依次排列；herdr 不支持 `tab.move` 时留在末尾）。`model`、`thinking` 可省略，省略时沿用当前会话的模型和思考等级 |
 
-另有只读工具 `context_usage`：返回当前会话的上下文 token 估计、窗口大小与占用百分比，供 skill 或规则判断是否建议压缩。始终注册，不受 `features` 影响。
+另有只读工具 `context_usage`：返回当前会话的上下文 token 估计、窗口大小与占用百分比，供 skill 或规则判断是否需要提醒。始终注册，不受 `features` 影响。
 
 `subagent` / `subagent_inline` 调用前会弹出确认（`features.confirm`）：执行、查看或编辑任务、换模型（并行时为全部使用同一模型）、取消；超时按 `confirmTimeoutSec` / `dispatch.inlineConfirmTimeoutSec` 自动执行（编辑或换模型后不再自动执行），Esc 取消。
 
@@ -119,7 +128,7 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 |---|---|
 | `models` | 代号 → `{ provider, id, desc }`。`desc` 写进分派策略的模型表，供分派时选模型 |
 | `fallback` | 请求失败时提示切换到的代号 |
-| `contextWarn` | 可选，`{ tokens, percent, userTurns }`，达到阈值时建议压缩，每项每会话提醒一次。`tokens` 为 token 数数组，缺省 `[300000]`，空数组不按 token 提醒；`percent` 为上下文窗口占用百分比，缺省不按百分比提醒；`userTurns` 为用户消息轮数，缺省 `20`，`0` 不按轮数提醒 |
+| `contextWarn` | 可选，`{ tokens, percent, userTurns }`，达到阈值时提示可按需交接或手动压缩，每项每会话提醒一次。`tokens` 为 token 数数组，缺省 `[300000]`，空数组不按 token 提醒；`percent` 为上下文窗口占用百分比，缺省不按百分比提醒；`userTurns` 为用户消息轮数，缺省 `20`，`0` 不按轮数提醒 |
 | `confirmTimeoutSec` | 新窗口分派确认的自动执行秒数，`0` 关闭 |
 | `dispatch.inlineRoles` | 在 herdr 中也走 `subagent_inline` 的角色 |
 | `dispatch.inlineConfirmTimeoutSec` | 窗口内分派确认的自动执行秒数，`0` 关闭 |
@@ -137,10 +146,10 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 |---|---|
 | `confirm` | 分派前确认 |
 | `contextWarn` | 上下文过长提醒 |
-| `handoffAutoClose` | `/route handoff` 或 `<<<` 成功后自动关闭来源窗口；关闭此开关则保留。`/route new` 和 `>>>` 不受影响 |
+| `handoffAutoClose` | `/route handoff` 或 `<<` 成功后自动关闭来源窗口；关闭此开关则保留。`/route new` 和 `>>>` 不受影响 |
 | `windowSubagent` | 开新窗口执行子代理（`subagent`，包括 `>>`）。关掉后策略里不出现开窗说明，调用被拦截 |
 | `inlineSubagent` | 窗口内子代理（`subagent_inline`）。关掉后策略里不出现对应说明，调用被拦截 |
-| `handoff` | 交接与无关新任务开新窗口（`handoff_open`、`/route handoff`、`<<<`，herdr 中的 `/route new` 与 `>>>`）。关掉后策略里不出现交接说明，交接工具和命令不可用；`/route new` 与 `>>>` 改走窗口内（若窗口内也关了则提示不可用），`<<` 不受影响 |
+| `handoff` | 交接与无关新任务开新窗口（`handoff_open`、`/route handoff`、`<<`，herdr 中的 `/route new` 与 `>>>`）。关掉后策略里不出现交接说明，交接工具和命令不可用；`/route new` 与 `>>>` 改走窗口内（若窗口内也关了则提示不可用），Pi 的 `/compact` 不受影响 |
 
 关掉的工具会从模型可见工具集中移除（`setActiveTools`），并以 `tool_call` 拦截作兜底。
 
@@ -163,15 +172,15 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 
 ### 内置默认行为规则
 
-内置默认：在本会话完成编码、验证和小杂务，不要主动调用 `subagent` / `subagent_inline` / `handoff_open`。只有用户明确要求（如「开子代理」「派给某个角色」「让某个角色验一下」「交接」「开新窗口」，或 `>>`、`>>>`、`<<<`、`/route new`、`/route handoff`）时才使用。认为某步适合拆出去时可以一句话建议，由用户决定。
+内置默认：在本会话完成编码、验证和小杂务，不要主动调用 `subagent` / `subagent_inline` / `handoff_open`。只有用户明确要求（如「开子代理」「派给某个角色」「让某个角色验一下」「交接」「开新窗口」，或 `>>`、`>>>`、`<<`、`/route new`、`/route handoff`）时才使用。认为某步适合拆出去时可以一句话建议，由用户决定。
 
 ## 不在 herdr 中运行时
 
 是否在 herdr 中，以环境变量 `HERDR_ENV=1` 且存在 `HERDR_PANE_ID` 判断。不在 herdr 中时：
 
 - **不可用**：开新窗口分派（包括 `>>`）、`handoff_open` 工具（不注册）、交接后自动关闭窗口。
-- **改变行为**：所有可分派角色都用 `subagent_inline` 窗口内执行，`dispatch.inlineRoles` 不再起作用；`/route new` 和 `>>>` 的新任务也在窗口内执行；`/route handoff` 和 `<<<` 只生成交接提示词，由你在新会话中使用。
-- **不受影响**：`<<` 压缩上下文、`@代号` 指定模型、分派确认、请求失败切 fallback、上下文提醒。
+- **改变行为**：所有可分派角色都用 `subagent_inline` 窗口内执行，`dispatch.inlineRoles` 不再起作用；`/route new` 和 `>>>` 的新任务也在窗口内执行；`/route handoff` 和 `<<` 只生成交接提示词，由你在新会话中使用。
+- **不受影响**：Pi 的 `/compact`、`@代号` 指定模型、分派确认、请求失败切 fallback、上下文提醒。
 
 在 herdr 中但没有安装 pi-herdr-subagents 时，`subagent` 工具不存在，开新窗口的角色无法分派；`handoff_open`（交接与无关新任务）和交接后自动关闭仍然可用。这种情况下把所有可分派角色写进 `dispatch.inlineRoles`。
 
@@ -202,6 +211,6 @@ pi-task-router/
 
 - **启动检查**：每个会话提示一次。pi 低于 1.3.0 时提示升级；在 herdr 中但没有 `subagent` 工具时，提示安装 pi-herdr-subagents 或把可分派角色写入 `dispatch.inlineRoles`；Windows 上在 herdr 中但 PATH 里没有 bash 时，提示加入 Git Bash 的 `bin` 目录。不在 herdr 中时不做 herdr 相关提示。`/route status` 会显示这些检查结果。Windows 上 `handoff_open` 用 `pi.cmd` 启动，不走 herdr `agent start --kind pi`（后者会打到 npm 无扩展脚本）。推理模型若当前思考档是 `off`（从非推理模型切过来，或中继未声明 thinkingLevelMap），会抬到 `medium`。
 - **请求失败切 fallback**：当前模型请求失败且不是 fallback 模型时，提示切换到 `fallback`。
-- **上下文过长提醒**：超过 `contextWarn` 阈值时，优先建议用 `/compact`（`<<`）原地压缩。只有明确需要换会话时才用 `/route handoff`（`<<<`）。每项每会话只提醒一次。
+- **上下文过长提醒**：达到 `contextWarn` 阈值时，提示可用 `<<` 交接，或手动输入 `/compact` 原地压缩，不会自动执行。每项每会话只提醒一次。
 - **配置无效时**：缺少配置文件、JSON 无效或校验失败时不注入分派规则，启动时提示错误；分派确认仍生效，但不会超时自动执行。
 - **统计未完成子窗口**：`/route handoff` 和上下文提醒前会读取 pi-herdr-subagents 的内部运行状态，统计本会话派生的未完成子窗口。这不是公开 API，读不到时按 0 处理，不拦截交接。
