@@ -2,16 +2,16 @@
  * task-router — 分派策略、分派确认与交接（新窗口执行层由 pi-herdr-subagents 负责）
  *
  * - 配置：只读 <agentDir>/task-router/config.json；读取或校验失败时不注入分派规则，session_start 提示错误
- * - 不自动选模型、不判断消息；只有用户主动用 >>、/route new 或在消息中明确要求时才分派
+ * - 不自动选模型、不判断消息；只有用户主动用 >>、>>>、/route new 或在消息中明确要求时才分派
  * - 拦截 subagent / subagent_inline：确认 / 编辑任务 / 换模型 / 取消（超时自动执行，0 关闭）
  * - auto-exit 与 interactive 只对新窗口执行（subagent）生效；窗口内执行不读这两项
- * - 上下文过长：提醒 /route handoff 交接
+ * - 上下文过长：优先提醒 /compact 压缩
  * - 当前模型请求失败（stopReason 为 error）且不是 fallback 本身：提供切换到 fallback
  * - /route [status|handoff [说明]|new [-c]|confirm on|confirm off]（status 含确认超时秒数）
- * - 前缀：@代号 指定首条消息模型（代号见配置 models）；>> 强制当作新任务（herdr 开窗，否则窗口内）；<< [说明] 等同 /route handoff；>> 与 /route new 后接 -c / --current 使用当前模型
+ * - 前缀：@代号 指定首条消息模型；<< 等同 /compact；<<< 等同 /route handoff；>> 开子代理，完成后关窗并回传；>>> 等同 /route new
  *
  * 角色定义：由 inline-subagent/agents.ts 从 pi 配置目录下的 agents/*.md 读取；字段与含义沿用 pi-herdr-subagents（disable-model-invocation: true 的角色不列入分派策略；spawning: false 禁止继续分派）。task-router 不定义私有字段和特殊角色名。
- * 无关新任务（>>、/route new）：herdr 中写任务说明并用 handoff_open 开普通会话；否则窗口内执行
+ * 无关新任务（>>>、/route new）：herdr 中写任务说明并用 handoff_open 开普通会话；否则窗口内执行
  * features：confirm / contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
  * policyFile：行为规则 markdown（缺省 <agentDir>/task-router/policy.md）；policyAppend 追加到末尾
  */
@@ -472,7 +472,7 @@ const DISPATCH_ROLE_LINES = DISPATCH_ROLES.map((r) => `- ${roleLine(r)}`).join("
 const DEFAULT_BEHAVIOR_POLICY = `# 行为规则
 
 - 默认在本会话完成所有工作，包括编码、验证、小杂务；不要主动调用 subagent、subagent_inline、handoff_open。
-- 只有用户在消息中明确要求时才使用子代理或交接，例如「开子代理」「派给某个角色」「让某个角色验一下」「交接」「开新窗口」，或用户使用了 \`>>\`、\`/route new\`、\`/route handoff\`。
+- 只有用户在消息中明确要求时才使用子代理或交接，例如「开子代理」「派给某个角色」「让某个角色验一下」「交接」「开新窗口」，或用户使用了 \`>>\`、\`>>>\`、\`/route new\`、\`/route handoff\`。
 - 若某步适合拆出去（独立审查、测试设计、输出量大只需结论的排查、无关新任务、上下文过长），可以一句话建议，由用户决定，不要自己调用。
 - task 必须自包含（子代理看不到本会话）：背景、相关文件、已定决策、具体任务、验收标准、汇报要点；不要带入无关内容。
 - model 用完整的 provider/id。
@@ -686,6 +686,8 @@ function setSingleTask(input: any, task: string): void {
 const countRunningSubagents = HS.countRunningSubagents;
 /** 交接开的普通会话要清掉的环境变量前缀：上游子窗口 + 本包窗口内子代理 */
 const WORKER_ENV_PREFIXES = [HS.ENV_PREFIX, INLINE_ENV_PREFIX];
+// 布局是用户偏好，不是子代理身份；交接后的普通会话继续沿用。
+const SUBAGENT_LAYOUT_ENV = `${HS.ENV_PREFIX}LAYOUT`;
 
 function herdrJson(args: string[], timeoutMs = 45_000): any {
 	try {
@@ -760,7 +762,7 @@ function startHandoffPi(paneId: string, agent: string, model: string, thinking: 
 	assertHandoffArg(thinking, "thinking");
 	if (IS_WIN32) {
 		const cmd = [
-			`Get-ChildItem Env: | Where-Object { ${WORKER_ENV_PREFIXES.map((p) => `$_.Name -like '${p}*'`).join(" -or ")} } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }`,
+			`Get-ChildItem Env: | Where-Object { $_.Name -ne '${SUBAGENT_LAYOUT_ENV}' -and (${WORKER_ENV_PREFIXES.map((p) => `$_.Name -like '${p}*'`).join(" -or ")}) } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }`,
 			`pi.cmd --model ${model} --thinking ${thinking}`,
 		].join("; ");
 		sleepSync(1500);
@@ -773,7 +775,7 @@ function startHandoffPi(paneId: string, agent: string, model: string, thinking: 
 	}
 	execFileSync(
 		"herdr",
-		["pane", "run", paneId, `for __v in $(env | awk -F= '/^(${WORKER_ENV_PREFIXES.join("|")})/{print $1}'); do unset "$__v"; done`],
+		["pane", "run", paneId, `for __v in $(env | awk -F= '/^(${WORKER_ENV_PREFIXES.join("|")})/ && $1 != "${SUBAGENT_LAYOUT_ENV}" {print $1}'); do unset "$__v"; done`],
 		{ encoding: "utf8", timeout: 10_000 },
 	);
 	sleepSync(400);
@@ -784,15 +786,21 @@ function escapeRegExp(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** 去掉末尾一次 ` handoff[数字]`。纯 `handoff[数字]`（无基名）视为无原窗口名。 */
+/** 去掉末尾一次 `[n]`，兼容旧式 ` handoff[n]`。纯 `[n]` / `handoff[n]` 视为无原窗口名。 */
 function stripHandoffSuffix(label: string): string {
-	if (/^handoff\[\d+\]$/.test(label)) return "";
-	const m = label.match(/^(.*) handoff\[(\d+)\]$/);
-	return m ? m[1] : label;
+	if (/^(?:handoff)?\[\d+\]$/.test(label)) return "";
+	const old = label.match(/^(.*) handoff\[\d+\]$/);
+	if (old) return old[1];
+	const neu = label.match(/^(.*)\[\d+\]$/);
+	return neu ? neu[1] : label;
+}
+
+function handoffLabelRe(base: string | undefined): RegExp {
+	return base ? new RegExp(`^${escapeRegExp(base)}(?: handoff)?\\[(\\d+)\\]$`) : /^(?:handoff)?\[(\d+)\]$/;
 }
 
 function nextHandoffIndex(labels: unknown[], base: string | undefined): number {
-	const re = base ? new RegExp(`^${escapeRegExp(base)} handoff\\[(\\d+)\\]$`) : /^handoff\[(\d+)\]$/;
+	const re = handoffLabelRe(base);
 	let max = 0;
 	for (const label of labels) {
 		if (typeof label !== "string") continue;
@@ -807,7 +815,7 @@ function nextHandoffIndex(labels: unknown[], base: string | undefined): number {
 function nextHandoffTabLabel(): string {
 	try {
 		const ws = process.env.HERDR_WORKSPACE_ID;
-		if (!ws) return "handoff[1]";
+		if (!ws) return "[1]";
 
 		let base: string | undefined;
 		const tabId = process.env.HERDR_TAB_ID;
@@ -830,12 +838,12 @@ function nextHandoffTabLabel(): string {
 			const tabs = listed?.result?.tabs;
 			if (Array.isArray(tabs)) labels = tabs.map((t: any) => t?.label);
 		} catch {
-			return "handoff[1]";
+			return "[1]";
 		}
 		const n = nextHandoffIndex(labels, base);
-		return base ? `${base} handoff[${n}]` : `handoff[${n}]`;
+		return base ? `${base}[${n}]` : `[${n}]`;
 	} catch {
-		return "handoff[1]";
+		return "[1]";
 	}
 }
 
@@ -883,18 +891,29 @@ function herdrSocketRequest(method: string, params: Record<string, unknown>, tim
 }
 
 /**
- * 交接窗口放到当前 tab 之后；跳过紧跟在后面、同一基名的已有交接 tab，保持 handoff[1]、[2]… 的顺序。
+ * 交接窗口放到当前 tab 之后；跳过紧跟在后面、同一基名的已有交接 tab，保持 [1]、[2]… 的顺序。
  * tab.move 的 insert_index 是移动前列表中的插入位置。尽力而为，失败不影响交接。
  */
 function handoffInsertIndex(tabs: Array<{ tab_id?: unknown; label?: unknown }>, currentTabId: string, newTabId: string, newLabel: string): number | undefined {
 	const cur = tabs.findIndex((t) => t?.tab_id === currentTabId);
 	if (cur < 0) return undefined;
 	const base = stripHandoffSuffix(newLabel);
-	const sibling = base ? new RegExp(`^${escapeRegExp(base)} handoff\\[\\d+\\]$`) : /^handoff\[\d+\]$/;
+	const sibling = handoffLabelRe(base);
 	let j = cur + 1;
 	while (j < tabs.length && tabs[j]?.tab_id !== newTabId && typeof tabs[j]?.label === "string" && sibling.test(tabs[j].label as string)) j++;
 	if (tabs[j]?.tab_id === newTabId) return undefined;
 	return j;
+}
+
+/** 开窗瞬间来源 pane 是否仍持有键盘焦点。查不到则不当前台，避免抢走用户正在用的窗口。 */
+function sourcePaneHasFocus(): boolean {
+	const paneId = process.env.HERDR_PANE_ID;
+	if (!paneId) return false;
+	try {
+		return herdrJson(["pane", "get", paneId])?.result?.pane?.focused === true;
+	} catch {
+		return false;
+	}
 }
 
 async function moveHandoffTabAfterCurrent(ws: string, newTabId: string, newLabel: string): Promise<void> {
@@ -916,7 +935,7 @@ async function openHandoffSession(file: string, model: string, thinking: string,
 	if (!ws) throw new Error("找不到 HERDR_WORKSPACE_ID");
 	const filePrompt = toPromptPath(file);
 	const label = nextHandoffTabLabel();
-	const created = herdrJson(["tab", "create", "--workspace", ws, "--cwd", cwd, "--label", label, "--focus"]);
+	const created = herdrJson(["tab", "create", "--workspace", ws, "--cwd", cwd, "--label", label, sourcePaneHasFocus() ? "--focus" : "--no-focus"]);
 	const tabId = created?.result?.tab?.tab_id;
 	const paneId = created?.result?.root_pane?.pane_id;
 	if (typeof tabId !== "string" || typeof paneId !== "string") throw new Error("herdr tab create 未返回 tab/pane id");
@@ -1049,7 +1068,7 @@ export {
 
 export default function (pi: ExtensionAPI) {
 	let confirmOn = FEATURES.confirm;
-	/** /route handoff 本轮：handoff_open 成功后，在 agent_settled 询问是否关闭本窗口 */
+	/** 显式交接：handoff_open 成功后，在 agent_settled 自动关闭来源窗口 */
 	let handoffPending = false;
 	let handoffOpened = false;
 	const enqueueDispatchConfirm = createSerialQueue();
@@ -1059,7 +1078,7 @@ export default function (pi: ExtensionAPI) {
 			name: "handoff_open",
 			label: "交接开窗",
 			description:
-				`读取 ${HANDOFF_DIR_PROMPT}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（去掉 ${WORKER_ENV_PREFIXES.map((p) => `${p}*`).join(" / ")}，不受子代理监视、不回传）。参数：file；model（provider/id）、thinking 可省略，省略时沿用当前会话的模型和思考等级。`,
+				`读取 ${HANDOFF_DIR_PROMPT}/ 下已写好的交接文件，在当前 workspace 新开 tab 启动普通 pi 会话（清除子代理身份环境变量，不受子代理监视、不回传）。参数：file；model（provider/id）、thinking 可省略，省略时沿用当前会话的模型和思考等级。`,
 			promptSnippet: `把交接说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md 后调用，开新 tab 接手。`,
 			parameters: Type.Object({
 				file: Type.String({ description: `交接文件路径，必须在 ${HANDOFF_DIR_PROMPT}/ 下` }),
@@ -1125,7 +1144,7 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	/** /route handoff 与 << 前缀共用：检查开关与未完成子任务，返回发给 agent 的交接指令；取消时返回 undefined */
+	/** /route handoff 与 <<< 前缀共用：检查开关与未完成子任务，返回发给 agent 的交接指令；取消时返回 undefined */
 	async function prepareHandoff(ctx: ExtensionContext, extra: string): Promise<string | undefined> {
 		if (!FEATURES.handoff) {
 			ctx.ui.notify("交接已关闭（features.handoff=false）", "warning");
@@ -1170,6 +1189,37 @@ export default function (pi: ExtensionAPI) {
 		return `[task-router] 用户提出了下面这个应分派出去的${kind}。不要在本会话中执行它。结合当前会话上下文写一份自包含的任务提示词，${how}\n\n用户原话：\n${original}`;
 	}
 
+	function prepareNewTask(ctx: ExtensionContext, raw: string, command: ">>>" | "/route new"): string | undefined {
+		const { task, useCurrent } = parseNewTask(raw);
+		if (!task) {
+			ctx.ui.notify(`用法：${command} [-c] <任务>（-c 使用当前模型）`, "warning");
+			return;
+		}
+		const mode = defaultDispatchMode();
+		if (!mode) {
+			ctx.ui.notify(`当前环境无法开普通会话，且窗口内子代理已关闭，${command} 不可用`, "warning");
+			return;
+		}
+		return dispatchText("新任务", task, mode, ctx, useCurrent);
+	}
+
+	function prepareWindowTask(ctx: ExtensionContext, raw: string): string | undefined {
+		const { task, useCurrent } = parseNewTask(raw);
+		if (!task) {
+			ctx.ui.notify("用法：>> [-c] <任务>（-c 使用当前模型）", "warning");
+			return;
+		}
+		if (!IN_HERDR || !FEATURES.windowSubagent || !hasSubagentTool(pi)) {
+			ctx.ui.notify(">> 需要 herdr、pi-herdr-subagents 和已开启的 features.windowSubagent", "warning");
+			return;
+		}
+		const current = useCurrent && ctx.model
+			? `显式传入 model: ${JSON.stringify(`${ctx.model.provider}/${ctx.model.id}`)}、thinking: ${JSON.stringify(ctx.thinkingLevel ?? pi.getThinkingLevel())}。`
+			: "省略 model 和 thinking，使用子代理的默认配置。";
+		// pi-herdr-subagents 的未指定角色模式支持自动退出，指定角色时则取决于角色的 auto-exit 配置。
+		return `[task-router] 用户要求将下面的任务交给新窗口子代理。结合当前会话写一份自包含的任务说明，调用 ${HS.WINDOW_TOOL}，传入 name、task 和 interactive: false，省略 agent（使用一次性子代理）。${current}本会话只负责分派，调用后结束本轮。子代理完成后自动关窗，结果由扩展异步回传到本会话，收到后向用户汇报。\n\n用户原话：\n${task}`;
+	}
+
 	// 系统提示注入（自动执行的子窗口由角色定义负责，不注入）
 	pi.on("before_agent_start", (event) => {
 		// 子代理约定与路由开关无关，始终注入
@@ -1183,8 +1233,22 @@ export default function (pi: ExtensionAPI) {
 
 	// 输入拦截
 	pi.on("input", async (event, ctx) => {
-		if (IS_WORKER || event.source !== "interactive" || event.streamingBehavior) return { action: "continue" };
+		if (IS_WORKER || event.source !== "interactive") return { action: "continue" };
 		let text = event.text.trim();
+		if (/^<<(?!<)/.test(text)) {
+			if (event.streamingBehavior || !ctx.isIdle()) {
+				ctx.ui.notify("请等本轮结束后再压缩上下文", "warning");
+				return { action: "handled" };
+			}
+			ctx.ui.notify("正在压缩上下文…", "info");
+			ctx.compact({
+				customInstructions: text.slice(2).trim() || undefined,
+				onComplete: () => ctx.ui.notify("上下文压缩完成", "info"),
+				onError: (error) => ctx.ui.notify(`压缩上下文失败：${error.message}`, "error"),
+			});
+			return { action: "handled" };
+		}
+		if (event.streamingBehavior) return { action: "continue" };
 		if (!text || text.startsWith("/") || text.startsWith("!")) return { action: "continue" };
 		// Read-only catalog queries are handled by the proxy audit extension, not task routing.
 		if (/^(?:请)?(?:帮我)?(?:更新中转站|查询模型|查询中转站模型)[。！!？?\s]*$/.test(text)) return { action: "continue" };
@@ -1192,23 +1256,19 @@ export default function (pi: ExtensionAPI) {
 		const msgs = branchMessages(ctx);
 		const hasUser = msgs.some((m) => m.role === "user");
 
-		if (text.startsWith("<<")) {
-			const msg = await prepareHandoff(ctx, text.slice(2).trim());
+		if (text.startsWith("<<<")) {
+			const msg = await prepareHandoff(ctx, text.slice(3).trim());
+			return msg ? { action: "transform", text: msg } : { action: "handled" };
+		}
+
+		if (text.startsWith(">>>")) {
+			const msg = prepareNewTask(ctx, text.slice(3).trim(), ">>>");
 			return msg ? { action: "transform", text: msg } : { action: "handled" };
 		}
 
 		if (text.startsWith(">>")) {
-			const { task, useCurrent } = parseNewTask(text.slice(2).trim());
-			if (!task) {
-				ctx.ui.notify("用法：>> [-c] <任务>（-c 使用当前模型）", "warning");
-				return { action: "handled" };
-			}
-			const mode = defaultDispatchMode();
-			if (!mode) {
-				if (ctx.hasUI) ctx.ui.notify("交接与窗口内子代理均已关闭，已在本会话处理", "warning");
-				return { action: "transform", text: task };
-			}
-			return { action: "transform", text: dispatchText("新任务", task, mode, ctx, useCurrent) };
+			const msg = prepareWindowTask(ctx, text.slice(2).trim());
+			return msg ? { action: "transform", text: msg } : { action: "handled" };
 		}
 
 		// 首条消息：@代号 手动指定模型
@@ -1376,11 +1436,8 @@ export default function (pi: ExtensionAPI) {
 		handoffOpened = false;
 		if (!event.aborted && IN_HERDR && ctx.hasUI && opened) {
 			if (!FEATURES.handoffAutoClose) return;
-			const choice = await ctx.ui.select("交接完成，关闭本窗口？", ["是", "否"]);
-			if (choice === "是") {
-				closeCurrentHerdrPaneAfterExit();
-				ctx.shutdown();
-			}
+			closeCurrentHerdrPaneAfterExit();
+			ctx.shutdown();
 			return;
 		}
 		if (event.aborted || !ctx.hasUI || IS_WORKER) return;
@@ -1415,7 +1472,7 @@ export default function (pi: ExtensionAPI) {
 		const warn = nextContextWarn(sid, usage, userTurns, warned);
 		if (warn && countRunningSubagents() === 0) {
 			warned.add(warn.key);
-			ctx.ui.notify(`💡 ${warn.reason}。如果无关或过时内容较多，可以用 /route handoff 让当前 agent 写交接提示词，在新窗口接手`, "warning");
+			ctx.ui.notify(`💡 ${warn.reason}。建议先用 /compact（<<）压缩上下文，在当前会话继续。`, "warning");
 		}
 	});
 
@@ -1433,11 +1490,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "new": {
-					const { task, useCurrent } = parseNewTask(extra);
-					if (!task) return ctx.ui.notify("用法：/route new [-c] <任务>（-c 使用当前模型）", "warning");
-					const mode = defaultDispatchMode();
-					if (!mode) return ctx.ui.notify("交接与窗口内子代理均已关闭，/route new 不可用", "warning");
-					pi.sendUserMessage(dispatchText("新任务", task, mode, ctx, useCurrent));
+					const msg = prepareNewTask(ctx, args.trim().slice(sub.length).trim(), "/route new");
+					if (msg) pi.sendUserMessage(msg);
 					return;
 				}
 				case "confirm":
