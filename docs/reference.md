@@ -9,13 +9,12 @@
 | 字段 | 作用 |
 |---|---|
 | `dispatch.inlineRoles` | 在 herdr 中也改用窗口内执行的角色名数组；没有 herdr 时不需要靠它分流。未安装 pi-herdr-subagents 时，可把要使用的角色都列在这里。 |
-| `confirmTimeoutSec` | 新窗口分派确认等待多少秒后自动执行。有效配置省略该字段时为 `30`；`0` 表示等待你确认，不自动执行。 |
-| `dispatch.inlineConfirmTimeoutSec` | 窗口内分派的确认时限，省略时为 `10` 秒，`0` 不自动执行。`/route setup` 生成的配置将两种时限都设为 `0`。 |
+| `dispatch.windowLayout` | herdr 子代理布局：`tab` 新标签页、`split` 右侧分屏、`split:down` 下方分屏。在 herdr 中且已安装 pi-herdr-subagents 时，`/route setup` 会询问；旧配置可手动添加。设定后优先于 `PI_SUBAGENT_LAYOUT`，不设则沿用环境变量（默认 `tab`）。不影响普通交接、独立新任务或失败接续。 |
 | `contextWarn` | 上下文提醒阈值。`tokens` 默认 `[300000]`，`[]` 关闭 token 阈值；`percent` 默认不设，取值大于 `0` 且不超过 `100`；`userTurns` 默认 `20`，`0` 关闭轮数阈值。达到任一阈值只提醒，不自动交接或压缩。 |
 | `policyFile` | 行为规则文件路径，支持 `~`，默认 `task-router/policy.md`。 |
 | `policyAppend` | 附加在行为规则末尾的文字。 |
 
-手动配置时保留 `dispatch`、`dispatch.inlineRoles` 和 `features`，即使只是空数组或空对象。分派确认可以用 `/route confirm on` 或 `/route confirm off` 临时切换。
+手动配置时保留 `dispatch`、`dispatch.inlineRoles` 和 `features`，即使只是空数组或空对象。旧的分派确认配置会被忽略，无需迁移。
 
 ### 功能开关
 
@@ -23,7 +22,6 @@
 
 | 键 | 控制的功能 |
 |---|---|
-| `confirm` | 子代理分派前确认。 |
 | `contextWarn` | 上下文过长提醒。 |
 | `handoffAutoClose` | 普通交接成功后关闭原窗口；独立新任务和失败接续不受影响。 |
 | `windowSubagent` | 开新窗口执行子代理，包括 `>>`。 |

@@ -3,13 +3,10 @@
 		"tokens": [300000],
 		"userTurns": 20
 	},
-	"confirmTimeoutSec": 0,
 	"dispatch": {
-		"inlineRoles": ["chore", "verifier"],
-		"inlineConfirmTimeoutSec": 0
+		"inlineRoles": ["chore", "verifier"]
 	},
 	"features": {
-		"confirm": true,
 		"contextWarn": true,
 		"handoffAutoClose": true
 	}

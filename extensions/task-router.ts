@@ -1,17 +1,17 @@
 /**
- * task-router — 分派策略、分派确认与交接（新窗口执行层由 pi-herdr-subagents 负责）
+ * task-router — 分派策略与交接（新窗口执行层由 pi-herdr-subagents 负责）
  *
  * - 配置：只读 <agentDir>/task-router/config.json；读取或校验失败时不注入分派规则，session_start 提示错误
  * - 不自动选模型、不判断消息；只有用户主动用 >>、>>>、/route new 或在消息中明确要求时才分派
  * - 拦截 subagent / subagent_inline：确认 / 编辑任务 / 换模型 / 取消（超时自动执行，0 关闭）
  * - auto-exit 与 interactive 只对新窗口执行（subagent）生效；窗口内执行不读这两项
  * - 上下文过长：提醒按需交接或手动压缩
- * - /route [status|setup|handoff [说明]|new <任务>|confirm on|confirm off]（status 含确认超时秒数）
+ * - /route [status|setup|handoff [说明]|new <任务>]
  * - 前缀：<< 等同 /route handoff；>> 开子代理，完成后关窗并回传；>>> 等同 /route new
  *
  * 角色定义：由 inline-subagent/agents.ts 从 pi 配置目录下的 agents/*.md 读取；字段与含义沿用 pi-herdr-subagents（disable-model-invocation: true 的角色不列入分派策略；spawning: false 禁止继续分派）。task-router 不定义私有字段和特殊角色名。
- * 无关新任务（>>>、/route new）：herdr 中写任务说明并用 handoff_open 开普通会话；否则窗口内执行
- * features：confirm / contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
+ * 独立新任务（>>>、/route new）：只转发本次任务；在 herdr 中开普通会话，否则窗口内执行
+ * features：contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
  * policyFile：行为规则 markdown（缺省 <agentDir>/task-router/policy.md）；policyAppend 追加到末尾
  */
 
@@ -55,26 +55,30 @@ function sleepSync(ms: number): void {
 
 // ───────────────────────── 配置 ─────────────────────────
 // 配置位于 <agentDir>/task-router/config.json
-// confirmTimeoutSec：分派确认框首次弹出后的自动执行秒数（缺省 30；0 关闭；Esc 仍拦截）
 // 角色说明只以角色文件为准（roles 已废弃，写了会被忽略并警告）
-// features：confirm / contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
+// features：contextWarn / handoffAutoClose / windowSubagent / inlineSubagent / handoff（缺省 true）
 // policyFile：行为规则 markdown 路径（支持 ~）；policyAppend 追加到末尾（不覆盖）
 
 type FeatureKey =
-	| "confirm"
 	| "contextWarn"
 	| "handoffAutoClose"
 	| "windowSubagent"
 	| "inlineSubagent"
 	| "handoff";
 type Features = Record<FeatureKey, boolean>;
+// 布局是用户偏好，不是子代理身份；交接后的普通会话继续沿用。
+const SUBAGENT_LAYOUT_ENV = `${HS.ENV_PREFIX}LAYOUT`;
+const WINDOW_LAYOUT_CHOICES = {
+	"新 Tab": "tab",
+	"右侧 Pane（分屏）": "split",
+	"下方 Pane（分屏）": "split:down",
+} as const;
+type WindowLayout = (typeof WINDOW_LAYOUT_CHOICES)[keyof typeof WINDOW_LAYOUT_CHOICES];
+
 interface RouterConfig {
 	/** 任一达到即提醒交接；percent 缺省不按百分比提醒，userTurns 为 0 不按轮数提醒 */
 	contextWarn: { tokens: number[]; percent?: number; userTurns: number };
-	/** 分派确认框首次弹出后的自动执行秒数；0 关闭 */
-	confirmTimeoutSec: number;
-	/** 窗口内执行：哪些角色走 subagent_inline，以及其确认超时 */
-	dispatch: { inlineRoles: string[]; inlineConfirmTimeoutSec: number };
+	dispatch: { inlineRoles: string[]; windowLayout?: WindowLayout };
 	features: Features;
 	/** 追加到分派规则末尾 */
 	policyAppend: string;
@@ -86,7 +90,6 @@ interface RouterConfig {
 const DEFAULT_CONTEXT_WARN = { tokens: [300_000], userTurns: 20 };
 
 const FEATURE_KEYS: FeatureKey[] = [
-	"confirm",
 	"contextWarn",
 	"handoffAutoClose",
 	"windowSubagent",
@@ -166,9 +169,11 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 	if (userTurns < 0) throw new Error("contextWarn.userTurns 必须是非负数（0 表示不按轮数提醒）");
 	const warnings: string[] = [];
 	if (raw.roles != null) warnings.push("roles 已废弃（角色说明以角色文件为准），已忽略");
-	const confirmTimeoutSec = optNum(raw.confirmTimeoutSec, 30, "confirmTimeoutSec");
-	if (confirmTimeoutSec < 0) throw new Error("confirmTimeoutSec 必须是非负数（0 关闭自动执行）");
 	if (!isPlainObject(raw.dispatch)) throw new Error("dispatch 必须是对象");
+	const windowLayout = raw.dispatch.windowLayout;
+	if (windowLayout !== undefined && windowLayout !== "tab" && windowLayout !== "split" && windowLayout !== "split:down") {
+		throw new Error("dispatch.windowLayout 必须是 tab、split 或 split:down");
+	}
 	const inlineRolesRaw = raw.dispatch.inlineRoles;
 	if (!Array.isArray(inlineRolesRaw) || inlineRolesRaw.some((x) => typeof x !== "string"))
 		throw new Error("dispatch.inlineRoles 必须是字符串数组");
@@ -185,12 +190,6 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 		}
 		if (!inlineRoles.includes(r)) inlineRoles.push(r);
 	}
-	const inlineConfirmTimeoutSec = optNum(
-		raw.dispatch.inlineConfirmTimeoutSec,
-		10,
-		"dispatch.inlineConfirmTimeoutSec",
-	);
-	if (inlineConfirmTimeoutSec < 0) throw new Error("dispatch.inlineConfirmTimeoutSec 必须是非负数（0 关闭自动执行）");
 	if (!isPlainObject(raw.features)) throw new Error("features 必须是对象");
 	const features = {} as Features;
 	for (const k of FEATURE_KEYS) features[k] = optBool(raw.features[k], true, `features.${k}`);
@@ -202,8 +201,7 @@ function validateConfig(raw: unknown): { cfg: RouterConfig; warnings: string[] }
 	return {
 		cfg: {
 			contextWarn: { tokens: [...(tokens as number[])].sort((a, b) => a - b), percent, userTurns },
-			confirmTimeoutSec,
-			dispatch: { inlineRoles, inlineConfirmTimeoutSec },
+			dispatch: { inlineRoles, ...(windowLayout === undefined ? {} : { windowLayout }) },
 			features,
 			policyAppend,
 			policyFile,
@@ -217,14 +215,12 @@ function joinWarnings(...parts: Array<string | undefined>): string | undefined {
 	return s || undefined;
 }
 
-/** 配置不可用时的空壳：不注入分派规则；确认仍开但超时为 0（不自动执行）。 */
+/** 配置不可用时的空壳：不注入分派规则。 */
 function pausedConfig(): RouterConfig {
 	return {
 		contextWarn: { tokens: [], userTurns: 0 },
-		confirmTimeoutSec: 0,
-		dispatch: { inlineRoles: [], inlineConfirmTimeoutSec: 0 },
+		dispatch: { inlineRoles: [] },
 		features: {
-			confirm: true,
 			contextWarn: false,
 			handoffAutoClose: false,
 			windowSubagent: true,
@@ -275,9 +271,7 @@ const CONFIG_WARNING = LOADED.warning;
 const CONTEXT_WARN_TOKENS = CFG.contextWarn.tokens;
 const CONTEXT_WARN_PERCENT = CFG.contextWarn.percent;
 const USER_TURN_WARN = CFG.contextWarn.userTurns;
-const CONFIRM_TIMEOUT_SEC = CFG.confirmTimeoutSec;
 const INLINE_ROLES = CFG.dispatch.inlineRoles;
-const INLINE_CONFIRM_TIMEOUT_SEC = CFG.dispatch.inlineConfirmTimeoutSec;
 const INLINE_ROLE_SET = new Set(INLINE_ROLES);
 const DISPATCH_ROLES = DISPATCHABLE_ROLES;
 const WINDOW_ROLES = DISPATCH_ROLES.filter((r) => !INLINE_ROLE_SET.has(r));
@@ -354,7 +348,7 @@ const INLINE_ENV_PREFIX = "PI_INLINE_";
 const INLINE_SUBAGENT = process.env.PI_INLINE_SUBAGENT === "1";
 const INLINE_AGENT = process.env.PI_INLINE_SUBAGENT_AGENT ?? "";
 const CURRENT_AGENT = INLINE_SUBAGENT ? INLINE_AGENT : SUBAGENT_ROLE;
-/** 子代理且 spawning:false：不选模型、不注入分派规则、不能继续分派、不检测新任务、不弹确认、不提醒上下文 */
+/** 子代理且 spawning:false：不选模型、不注入分派规则、不能继续分派、不检测新任务、不提醒上下文 */
 function computeIsWorker(): boolean {
 	if (!INLINE_SUBAGENT && !SUBAGENT_ID) return false;
 	const agent = AGENT_BY_NAME.get(CURRENT_AGENT);
@@ -365,6 +359,7 @@ const SPAWN_TOOL_NAMES = new Set<string>([
 	...HS.SPAWN_TOOLS,
 	"subagent_inline",
 	"handoff_open",
+	"route_new_open",
 ]);
 
 /** 仅初始化缺失的配置。先收集、校验，再独占创建；并发启动的会话也不能覆盖对方。 */
@@ -388,12 +383,18 @@ async function setupConfig(pi: ExtensionAPI, ctx: ExtensionCommandContext): Prom
 	if (contextWarn === undefined) return;
 	const handoffAutoClose = IN_HERDR ? await toggle("交接成功后自动关闭原窗口？") : undefined;
 	if (IN_HERDR && handoffAutoClose === undefined) return;
-	const inlineRoles = IN_HERDR && !hasSubagentTool(pi)
+	const windowToolAvailable = IN_HERDR && hasSubagentTool(pi);
+	let windowLayout: WindowLayout | undefined;
+	if (windowToolAvailable) {
+		const choice = await ui.select("开窗口的子代理使用哪种布局？", Object.keys(WINDOW_LAYOUT_CHOICES));
+		if (choice === undefined) return;
+		windowLayout = WINDOW_LAYOUT_CHOICES[choice as keyof typeof WINDOW_LAYOUT_CHOICES];
+	}
+	const inlineRoles = IN_HERDR && !windowToolAvailable
 		? DISPATCHABLE_ROLES
 		: DISPATCHABLE_ROLES.filter((role) => role === "chore" || role === "verifier");
 	const config = {
-		confirmTimeoutSec: 0,
-		dispatch: { inlineRoles, inlineConfirmTimeoutSec: 0 },
+		dispatch: { inlineRoles, ...(windowLayout === undefined ? {} : { windowLayout }) },
 		features: { contextWarn, ...(handoffAutoClose === undefined ? {} : { handoffAutoClose }) },
 	};
 	if (!ctx.isIdle()) {
@@ -429,11 +430,6 @@ function branchMessages(ctx: ExtensionContext): any[] {
 		.map((e: any) => e.message);
 }
 
-function agentDefault(agent: string | undefined, field: "model" | "thinking"): string | undefined {
-	if (!agent) return undefined;
-	return AGENT_BY_NAME.get(agent)?.[field];
-}
-
 const WORKER_DENY_SPAWN = IS_WORKER;
 
 function modelSupportsReasoning(model: { reasoning?: boolean } | undefined): boolean {
@@ -449,7 +445,6 @@ function ensureThinkingOn(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	pi.setThinkingLevel("medium");
 }
 
-type DispatchMode = "inline" | "handoff";
 
 // ───────────────────────── 系统提示 ─────────────────────────
 
@@ -466,7 +461,7 @@ const DISPATCH_ROLE_LINES = DISPATCH_ROLES.map((r) => `- ${roleLine(r)}`).join("
 
 const DEFAULT_BEHAVIOR_POLICY = `# 行为规则
 
-- 默认在本会话完成所有工作，包括编码、验证、小杂务；不要主动调用 subagent、subagent_inline、handoff_open。
+- 默认在本会话完成所有工作，包括编码、验证、小杂务；不要主动调用 subagent、subagent_inline、handoff_open、route_new_open。
 - 只有用户在消息中明确要求时才使用子代理或交接，例如「开子代理」「派给某个角色」「让某个角色验一下」「交接」「开新窗口」，或用户使用了 \`>>\`、\`>>>\`、\`/route new\`、\`/route handoff\`。
 - 若某步适合拆出去（独立审查、测试设计、输出量大只需结论的排查、无关新任务、上下文过长），可以一句话建议，由用户决定，不要自己调用。
 - task 必须自包含（子代理看不到本会话）：背景、相关文件、已定决策、具体任务、验收标准、汇报要点；不要带入无关内容。
@@ -562,7 +557,7 @@ function blockedToolNames(): string[] {
 	const names: string[] = [];
 	if (!FEATURES.windowSubagent) names.push(HS.WINDOW_TOOL);
 	if (!FEATURES.inlineSubagent) names.push("subagent_inline");
-	if (!FEATURES.handoff) names.push("handoff_open");
+	if (!FEATURES.handoff) names.push("handoff_open", "route_new_open");
 	return names;
 }
 
@@ -612,11 +607,11 @@ function buildFacts(herdr: boolean, features: Features = FEATURES): string {
 
 	if (handoffOn && herdr) {
 		sections.push(
-			`交接当前任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file；默认省略 model、thinking）。新窗口是普通会话，结果不回传。\n- 与主题无关的新任务同样用这种方式在新窗口开普通会话：说明里写任务本身（背景、目标、相关文件、验收标准、「第一步」）。`,
+			`交接当前任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（目标、当前进度、关键决定、相关文件、未完成步骤、注意事项，以及「第一步」），再调用 handoff_open（file；默认省略 model、thinking）。新窗口是普通会话，结果不回传。\n- 开始独立新任务：调用 route_new_open，只传用户这次给出的任务原文，不附带当前会话的背景、进度或其他历史，不关闭原窗口。用户明确指定启动模型时，单独用 model 参数传递。`,
 		);
 	} else if (handoffOn) {
 		sections.push(
-			`交接或开始无关新任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md。当前不在 herdr 中，handoff_open 不可用；把提示词交给用户在新会话中继续。`,
+			`交接当前任务：把自包含说明写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md。当前不在 herdr 中，handoff_open 不可用；把提示词交给用户在新会话中继续。`,
 		);
 	} else if (!herdr) {
 		sections.push("需要全新会话时，写一份自包含提示词交给用户，建议用户在新会话中执行。");
@@ -636,54 +631,11 @@ function buildPolicy(herdr: boolean, behavior: string = POLICY_LOAD.text, featur
 const POLICY_HERDR = buildPolicy(true);
 const POLICY_PLAIN = buildPolicy(false);
 
-type DispatchJob = { agent: string; task: string; model?: string; thinking?: string; name?: string };
-
-function dispatchJobs(input: any): DispatchJob[] {
-	if (!input || typeof input !== "object") return [];
-	const topModel = typeof input.model === "string" ? input.model : undefined;
-	const topThinking = typeof input.thinking === "string" ? input.thinking : undefined;
-	const fromList = (list: any[]): DispatchJob[] =>
-		list.map((t) => ({
-			agent: String(t?.agent ?? ""),
-			task: String(t?.task ?? ""),
-			model: typeof t?.model === "string" ? t.model : topModel,
-			thinking: typeof t?.thinking === "string" ? t.thinking : topThinking,
-		}));
-	if (Array.isArray(input.tasks) && input.tasks.length > 0) return fromList(input.tasks);
-	return [
-		{
-			agent: String(input.agent ?? ""),
-			task: String(input.task ?? ""),
-			model: topModel,
-			thinking: topThinking,
-			name: typeof input.name === "string" ? input.name : undefined,
-		},
-	];
-}
-
-function applyModelThinking(input: any, model?: string, thinking?: string): void {
-	if (model) {
-		input.model = model;
-		if (Array.isArray(input.tasks)) for (const t of input.tasks) t.model = model;
-	}
-	if (thinking) {
-		input.thinking = thinking;
-		if (Array.isArray(input.tasks)) for (const t of input.tasks) t.thinking = thinking;
-	}
-}
-
-function setSingleTask(input: any, task: string): void {
-	if (Array.isArray(input.tasks) && input.tasks.length === 1) input.tasks[0].task = task;
-	else input.task = task;
-}
-
 // ───────────────────────── 扩展 ─────────────────────────
 
 const countRunningSubagents = HS.countRunningSubagents;
 /** 交接开的普通会话要清掉的环境变量前缀：上游子窗口 + 本包窗口内子代理 */
 const WORKER_ENV_PREFIXES = [HS.ENV_PREFIX, INLINE_ENV_PREFIX];
-// 布局是用户偏好，不是子代理身份；交接后的普通会话继续沿用。
-const SUBAGENT_LAYOUT_ENV = `${HS.ENV_PREFIX}LAYOUT`;
 
 function herdrJson(args: string[], timeoutMs = 45_000): any {
 	try {
@@ -969,6 +921,17 @@ async function openHandoffSession(file: string, model: string, thinking: string,
 	return { tabId, paneId, agent };
 }
 
+async function openNewTask(task: string, model: string, thinking: string, cwd: string): Promise<{ tabId: string; paneId: string; agent: string }> {
+	const opened = await openOrdinaryTab(model, thinking, cwd);
+	try {
+		herdrJson(["agent", "prompt", "--", opened.paneId, task]);
+	} catch (error) {
+		// Submission may already have reached Pi. Keep the new tab and never retry automatically.
+		throw new Error(`新会话已启动（tab ${opened.tabId}，pane ${opened.paneId}），但未能确认任务已发送。请先检查新窗口，不要自动重试：${error instanceof Error ? error.message : String(error)}`);
+	}
+	return opened;
+}
+
 const RECOVERY_FLAG = "task-router-recovery";
 const RECOVERY_DRAFT = "从本会话已有进度继续处理上一条尚未完成的用户请求。先根据对话和工具记录确认已完成的工作；如果某个操作是否成功不清楚，先核对现状，不要直接重做。只继续未完成的部分。";
 type RecoveryTarget = { sourceFile: string; sourceId: string; model: string };
@@ -1054,18 +1017,6 @@ function closeCurrentHerdrPaneAfterExit(): void {
 	child.unref();
 }
 
-function createSerialQueue(): <T>(fn: () => Promise<T>) => Promise<T> {
-	let tail: Promise<unknown> = Promise.resolve();
-	return (fn) => {
-		const run = tail.then(fn, fn);
-		tail = run.then(
-			() => undefined,
-			() => undefined,
-		);
-		return run;
-	};
-}
-
 function contextWarnSummary(): string {
 	if (!FEATURES.contextWarn) return "关";
 	const parts = [
@@ -1101,7 +1052,6 @@ function nextContextWarn(
 
 export {
 	handoffInsertIndex,
-	createSerialQueue,
 	countRunningSubagents,
 	nextContextWarn,
 	isPiVersionBelow,
@@ -1115,11 +1065,9 @@ export {
 };
 
 export default function (pi: ExtensionAPI) {
-	let confirmOn = FEATURES.confirm;
 	/** 显式交接：handoff_open 成功后，在 agent_settled 自动关闭来源窗口 */
 	let handoffPending = false;
 	let handoffOpened = false;
-	const enqueueDispatchConfirm = createSerialQueue();
 
 	pi.registerFlag(RECOVERY_FLAG, { type: "string", description: "Internal: prefill a verified failure-recovery session" });
 	let recoveryStartupHandled = false;
@@ -1169,6 +1117,28 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	if (IN_HERDR && FEATURES.handoff) {
+		pi.registerTool({
+			name: "route_new_open",
+			label: "独立新任务",
+			description: "仅在用户明确要求另起独立新任务时，在新窗口启动普通 Pi 会话并直接发送本次任务。不发送当前会话历史、不关闭原窗口。",
+			parameters: Type.Object({
+				task: Type.String({ description: "本次任务的原文。" }),
+				model: Type.Optional(Type.String({ description: "用户明确指定的启动模型，完整 provider/id；省略则沿用当前模型。" })),
+			}),
+			executionMode: "sequential",
+			async execute(_id, params, _signal, _onUpdate, ctx) {
+				if (IS_WORKER) throw new Error("当前角色不允许开新窗口");
+				const task = params.task;
+				if (!task?.trim()) throw new Error("缺少新任务内容");
+				const model = params.model?.trim() || (ctx.model && modelRef(ctx.model));
+				if (!model) throw new Error("当前会话没有模型，需要显式传 model");
+				const opened = await openNewTask(task, model, ctx.thinkingLevel ?? pi.getThinkingLevel(), ctx.cwd);
+				return {
+					content: [{ type: "text", text: `已在新 tab 发送独立任务（${opened.tabId}）。原窗口保留，结果不回传。` }],
+					details: opened,
+				};
+			},
+		});
 		pi.registerTool({
 			name: "handoff_open",
 			label: "交接开窗",
@@ -1238,17 +1208,26 @@ export default function (pi: ExtensionAPI) {
 		else console.error(`[task-router] ${msg}`);
 	});
 
+	const windowLayout = CFG.dispatch.windowLayout;
+	if (IN_HERDR && windowLayout !== undefined) {
+		let previousLayout: string | undefined;
+		pi.on("session_start", () => {
+			previousLayout = process.env[SUBAGENT_LAYOUT_ENV];
+			process.env[SUBAGENT_LAYOUT_ENV] = windowLayout;
+		});
+		pi.on("session_shutdown", () => {
+			// On /reload, restore the shell preference before applying the new config.
+			if (process.env[SUBAGENT_LAYOUT_ENV] !== windowLayout) return;
+			if (previousLayout === undefined) delete process.env[SUBAGENT_LAYOUT_ENV];
+			else process.env[SUBAGENT_LAYOUT_ENV] = previousLayout;
+		});
+	}
+
 	pi.on("model_select", (_event, ctx) => {
 		ensureThinkingOn(pi, ctx);
 	});
 
 	const warned = new Set<string>();
-
-	function defaultDispatchMode(): DispatchMode | undefined {
-		if (IN_HERDR && FEATURES.handoff) return "handoff";
-		if (FEATURES.inlineSubagent) return "inline";
-		return undefined;
-	}
 
 	/** /route handoff 与 << 前缀共用：检查开关与未完成子任务，返回发给 agent 的交接指令；取消时返回 undefined */
 	async function prepareHandoff(ctx: ExtensionContext, extra: string): Promise<string | undefined> {
@@ -1278,25 +1257,36 @@ export default function (pi: ExtensionAPI) {
 		}${extra ? `\n用户补充：${extra}` : ""}`;
 	}
 
-	function dispatchText(original: string, mode: DispatchMode): string {
-		const how =
-			mode === "handoff"
-				? `写到 ${HANDOFF_DIR_PROMPT}/<名称>-<日期时间>.md（背景、目标、相关文件、验收标准、「第一步」），再调用 handoff_open（file；默认省略 model、thinking，继承当前会话）。新窗口是普通会话，结果不回传。`
-				: `调用 subagent_inline 在窗口内同步执行（${(IN_HERDR ? INLINE_ROLES : DISPATCH_ROLES).join(" / ") || DISPATCH_ROLES.join(" / ") || "（无）"}）。默认省略 model、thinking，使用角色配置；用户明确要求使用当前模型时，显式传当前模型和思考等级。`;
-		return `[task-router] 用户提出了下面这个应分派出去的新任务。不要在本会话中执行它。结合当前会话上下文写一份自包含的任务提示词，${how}${MODEL_LOOKUP_RULE}\n\n用户原话：\n${original}`;
-	}
-
-	function prepareNewTask(ctx: ExtensionContext, task: string, command: ">>>" | "/route new"): string | undefined {
+	async function dispatchNewTask(ctx: ExtensionContext, task: string, command: ">>>" | "/route new"): Promise<string | undefined> {
 		if (!task) {
 			ctx.ui.notify(`用法：${command} <任务>`, "warning");
 			return;
 		}
-		const mode = defaultDispatchMode();
-		if (!mode) {
+		if (IS_WORKER) {
+			ctx.ui.notify("当前角色不允许继续分派", "warning");
+			return;
+		}
+		if (!ctx.model) {
+			ctx.ui.notify("当前会话没有模型，请先用 /model 选择模型", "warning");
+			return;
+		}
+		const model = modelRef(ctx.model);
+		const thinking = ctx.thinkingLevel ?? pi.getThinkingLevel();
+		if (IN_HERDR && FEATURES.handoff) {
+			try {
+				const opened = await openNewTask(task, model, thinking, ctx.cwd);
+				ctx.ui.notify(`已在新 tab 发送独立任务（${opened.tabId}）`, "info");
+			} catch (error) {
+				ctx.ui.notify(`新任务开窗失败：${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+			return;
+		}
+		if (!FEATURES.inlineSubagent) {
 			ctx.ui.notify(`当前环境无法开普通会话，且窗口内子代理已关闭，${command} 不可用`, "warning");
 			return;
 		}
-		return dispatchText(task, mode);
+		const roles = (IN_HERDR ? INLINE_ROLES : DISPATCH_ROLES).join(" / ") || "（无）";
+		return `[task-router] 用户明确要求独立执行下面的新任务。不要在本会话执行，不补充当前会话的上下文，不解析任务中的模型指令。调用 subagent_inline 在窗口内同步执行（${roles}），将下面的任务原文作为 task，固定传 model: ${JSON.stringify(model)} 和 thinking: ${JSON.stringify(thinking)}。\n\n用户原话：\n${task}`;
 	}
 
 	function prepareWindowTask(ctx: ExtensionContext, task: string): string | undefined {
@@ -1337,7 +1327,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (text.startsWith(">>>")) {
-			const msg = prepareNewTask(ctx, text.slice(3).trim(), ">>>");
+			const msg = await dispatchNewTask(ctx, text.slice(3).trim(), ">>>");
 			return msg ? { action: "transform", text: msg } : { action: "handled" };
 		}
 
@@ -1349,47 +1339,8 @@ export default function (pi: ExtensionAPI) {
 		return { action: "continue" };
 	});
 
-	function jobRuntime(job: DispatchJob, ctx: ExtensionContext): { model: string; thinking: string } {
-		return {
-			model: job.model ?? agentDefault(job.agent, "model") ?? `继承 ${ctx.model?.provider}/${ctx.model?.id}`,
-			thinking: job.thinking ?? agentDefault(job.agent, "thinking") ?? "继承",
-		};
-	}
-
-	function confirmTitle(toolName: string, input: any, jobs: DispatchJob[], ctx: ExtensionContext): string {
-		const place = toolName === "subagent_inline" ? "窗口内执行" : "新窗口执行";
-		if (jobs.length <= 1) {
-			const job = jobs[0] ?? { agent: "", task: "" };
-			const { model, thinking } = jobRuntime(job, ctx);
-			const name = job.name ?? input.name;
-			return `⇢ ${place}${name ? `「${name}」` : ""} 角色：${job.agent || "（无）"}${input.fork ? " · fork" : ""}\n   模型：${model} • ${thinking} ｜ 任务 ${String(job.task ?? "").length} 字`;
-		}
-		const mode = "并行";
-		const lines = jobs.map((job, i) => {
-			const { model, thinking } = jobRuntime(job, ctx);
-			return `   ${i + 1}. 角色：${job.agent || "（无）"} ｜ ${model} • ${thinking} ｜ 任务 ${String(job.task ?? "").length} 字`;
-		});
-		return `⇢ ${place} ${mode} ${jobs.length} 项\n${lines.join("\n")}`;
-	}
-
-	/** 只用 ctx.ui.select 自带 timeout（含倒计时）。Esc 与超时都返回 undefined，用耗时区分：计时起点早于对话框内部计时器，超时必然 >= timeoutMs；留 20ms 容差防计时器提前触发；代价是超时前 20ms 内的 Esc 会被当成超时执行（原为 500ms）。 */
-	async function selectChoice(
-		ctx: ExtensionContext,
-		title: string,
-		options: string[],
-		timeoutMs: number | undefined,
-	): Promise<{ choice: string | undefined; timedOut: boolean }> {
-		if (!timeoutMs || timeoutMs <= 0) {
-			return { choice: await ctx.ui.select(title, options), timedOut: false };
-		}
-		const started = Date.now();
-		const choice = await ctx.ui.select(title, options, { timeout: timeoutMs });
-		if (choice !== undefined) return { choice, timedOut: false };
-		return { choice: undefined, timedOut: Date.now() - started >= timeoutMs - 20 };
-	}
-
-	// 拦截 subagent / subagent_inline：确认 / 编辑 / 换模型 / 取消
-	pi.on("tool_call", async (event, ctx) => {
+	// 保留子代理权限和功能开关的工具拦截。
+	pi.on("tool_call", (event) => {
 		if (WORKER_DENY_SPAWN && SPAWN_TOOL_NAMES.has(event.toolName)) {
 			return {
 				block: true,
@@ -1409,72 +1360,12 @@ export default function (pi: ExtensionAPI) {
 				reason: "窗口内子代理已关闭（features.inlineSubagent=false）。不要调用 subagent_inline。",
 			};
 		}
-		if (event.toolName === "handoff_open" && !FEATURES.handoff) {
+		if ((event.toolName === "handoff_open" || event.toolName === "route_new_open") && !FEATURES.handoff) {
 			return {
 				block: true,
-				reason: "交接已关闭（features.handoff=false）。不要调用 handoff_open。",
+				reason: `交接和独立新任务开窗已关闭（features.handoff=false）。不要调用 ${event.toolName}。`,
 			};
 		}
-		const isInline = event.toolName === "subagent_inline";
-		const isWindow = event.toolName === HS.WINDOW_TOOL;
-		if (!isInline && !isWindow) return;
-		const input = event.input as any;
-		const jobs = dispatchJobs(input);
-		if (IS_WORKER || !confirmOn || !ctx.hasUI) return;
-
-		const confirmTimeoutSec = isInline ? INLINE_CONFIRM_TIMEOUT_SEC : CONFIRM_TIMEOUT_SEC;
-		return enqueueDispatchConfirm(async () => {
-			let interacted = false;
-			for (;;) {
-				const timeoutMs = !interacted && confirmTimeoutSec > 0 ? confirmTimeoutSec * 1000 : undefined;
-				const options = [
-					"执行",
-					...(jobs.length === 1 ? ["查看或编辑任务"] : []),
-					jobs.length > 1 ? "全部使用同一模型" : "换模型",
-					"取消",
-				];
-				const { choice, timedOut } = await selectChoice(
-					ctx,
-					confirmTitle(event.toolName, input, jobs, ctx),
-					options,
-					timeoutMs,
-				);
-				if (choice === "查看或编辑任务") {
-					interacted = true;
-					const edited = await ctx.ui.editor("编辑任务提示词", jobs[0]?.task ?? "");
-					if (edited !== undefined) {
-						setSingleTask(input, edited);
-						if (jobs[0]) jobs[0].task = edited;
-					}
-					continue;
-				}
-				if (choice === "换模型" || choice === "全部使用同一模型") {
-					interacted = true;
-					const models = availableModels(ctx);
-					if (!models.size) {
-						ctx.ui.notify("Pi 没有已配置凭据的模型可选。", "warning");
-						continue;
-					}
-					const model = await ctx.ui.select("选择模型", [...models.keys()]);
-					if (!model) continue;
-					const level = await ctx.ui.select("思考等级", ["保持原设置", "low", "medium", "high"]);
-					if (level === undefined) continue;
-					const thinking = level === "保持原设置" ? undefined : level;
-					applyModelThinking(input, model, thinking);
-					for (const job of jobs) {
-						job.model = model;
-						if (thinking) job.thinking = thinking;
-					}
-					continue;
-				}
-				if (choice === "执行") return;
-				if (choice === undefined && timedOut) {
-					ctx.ui.notify(isInline ? "未在限时内选择，已按默认在窗口内执行" : "未在限时内选择，已按默认开新窗口执行", "info");
-					return;
-				}
-				return { block: true, reason: "用户取消了这次分派。不要重试，询问用户希望如何处理。" };
-			}
-		});
 	});
 
 	pi.on("tool_result", (event) => {
@@ -1499,13 +1390,16 @@ export default function (pi: ExtensionAPI) {
 		const warn = nextContextWarn(sid, usage, userTurns, warned);
 		if (warn && countRunningSubagents() === 0) {
 			warned.add(warn.key);
-			ctx.ui.notify(`💡 ${warn.reason}。需要换会话时用 <<（/route handoff）；只想腾空间且旧内容可以概括时，用 /compact。`, "warning");
+			ctx.ui.notify(
+				`💡 ${warn.reason}\n（推荐）直接交接到新会话: << [可选说明及指派模型]\n在当前会话压缩上下文: /compact [可选说明]`,
+				"warning",
+			);
 		}
 	});
 
 	// /route 命令
 	pi.registerCommand("route", {
-		description: "task-router：status | setup | handoff [说明] | new <任务> | confirm on|off",
+		description: "task-router：status | setup | handoff [说明] | new <任务>",
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			const extra = rest.join(" ");
@@ -1519,13 +1413,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "new": {
-					const msg = prepareNewTask(ctx, args.trim().slice(sub.length).trim(), "/route new");
+					const msg = await dispatchNewTask(ctx, args.trim().slice(sub.length).trim(), "/route new");
 					if (msg) pi.sendUserMessage(msg);
 					return;
 				}
-				case "confirm":
-					confirmOn = rest[0] !== "off";
-					return ctx.ui.notify(`分派前确认：${confirmOn ? "开" : "关"}`, "info");
 				default: {
 					const u = ctx.getContextUsage();
 					const rolePlace = (name: string) => {
@@ -1549,15 +1440,14 @@ export default function (pi: ExtensionAPI) {
 							`上下文：${u?.tokens ?? "?"} tokens（${u?.percent != null ? Math.round(u.percent) : "?"}%）`,
 							`交接提醒：${contextWarnSummary()}`,
 							`配置：${LOADED.missing ? "尚未创建，输入 /route setup 开始配置" : ROUTING_PAUSED ? "读取/校验失败，未注入分派规则" : CONFIG_PATH}`,
-							`分派确认：${confirmOn ? "开" : "关"} ｜ herdr：${IN_HERDR ? "是" : "否"}`,
+							`herdr：${IN_HERDR ? "是" : "否"}`,
 							piVersionStatusLine(),
 							IN_HERDR
-								? `subagent 工具：${hasSubagentTool(pi) ? "有" : "无（开新窗口分派不可用）"}`
+								? `subagent 工具：${hasSubagentTool(pi) ? `有 ｜ 布局：${CFG.dispatch.windowLayout ?? (process.env[SUBAGENT_LAYOUT_ENV]?.trim() || "tab")}` : "无（开新窗口分派不可用）"}`
 								: "",
 							IN_HERDR && IS_WIN32
 								? `bash：${WIN_BASH_ON_PATH ? "PATH 中有" : "PATH 中无（开新窗口需要 Git Bash 的 bin）"}`
 								: "",
-							`确认超时：${CONFIRM_TIMEOUT_SEC === 0 ? "关" : `${CONFIRM_TIMEOUT_SEC} 秒`} ｜ 窗口内确认超时：${INLINE_CONFIRM_TIMEOUT_SEC === 0 ? "关" : `${INLINE_CONFIRM_TIMEOUT_SEC} 秒`}`,
 							...roleLines,
 							featureLine,
 							`行为规则：${POLICY_LOAD.source === "file" ? `文件 ${POLICY_FILE}` : `内置默认（${POLICY_FILE}）`}`,

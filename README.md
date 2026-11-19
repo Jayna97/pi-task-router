@@ -12,16 +12,16 @@ pi install git:github.com/Jayna97/pi-task-router
 
 启动 Pi（已打开就用 `/reload`），输入 `/route setup` 完成首次配置。
 
-- 开新窗口需要 [herdr](https://herdr.dev)。没有 herdr 时，子任务和独立新任务在窗口内执行，普通交接只生成提示词。
-- 要用 `>>` 开子代理窗口，还需 `pi install npm:pi-herdr-subagents`；Windows 上需将 bash 加入 PATH。普通交接和失败接续不需要这个包。
+- 开新窗口需要 [herdr](https://herdr.dev)。没有 herdr 时，`>>` 不可用，`>>>` 回退到窗口内子代理（需启用），`<<` 只生成交接提示词。
+- 要用 `>>` 开子代理窗口，还需 `pi install npm:pi-herdr-subagents`；Windows 上需将 bash 加入 PATH。装好后，首次配置可选 Tab 或分屏 Pane。普通交接和失败接续不需要这个包。
 
 ## 常用操作
 
 | 输入 | 用途 |
 |---|---|
-| `>> 检查这次改动` | 开一个子代理窗口，完成后把结果带回当前会话。 |
-| `<< 接下来先跑测试` | 把当前任务交接到新会话。成功交接后默认关闭原窗口，可用 `features.handoffAutoClose` 关闭自动关窗。 |
-| `>>> 整理下载目录` | 开一个独立会话做无关任务，不关闭原窗口。 |
+| `>> <任务内容> [指定模型]` | 开一个子代理窗口，完成后把结果带回当前会话。 |
+| `<< [可选说明及指定模型]` | 把当前任务交接到新会话。成功交接后默认关闭原窗口，可在配置中切换。 |
+| `>>> <任务内容>` | 用当前模型直接开新会话，只发送本次任务，不带历史、不关闭原窗口。 |
 | `/route status` | 查看当前配置、角色和可用功能。 |
 
 ## 请求失败后接续
@@ -32,4 +32,4 @@ pi install git:github.com/Jayna97/pi-task-router
 
 ## 配置与角色
 
-需要调整功能开关、确认时限或添加角色时，见[配置与角色参考](docs/reference.md)。也可直接查看[配置示例](task-router.example.json)和[行为规则示例](task-router.policy.example.md)。
+需要调整功能开关或添加角色时，见[配置与角色参考](docs/reference.md)。也可直接查看[配置示例](task-router.example.json)和[行为规则示例](task-router.policy.example.md)。
