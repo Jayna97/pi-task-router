@@ -1,43 +1,16 @@
 {
-	"models": {
-		"flash": {
-			"provider": "deepseek",
-			"id": "deepseek-flash",
-			"desc": "快且便宜，1M 上下文。问答、总结、小脚本、缓存清理/文件整理、机械批量修改、跑命令"
-		},
-		"grok": {
-			"provider": "xai",
-			"id": "grok-4.6",
-			"desc": "默认主力，500K 上下文。常规编码、修 bug、按明确计划实现、测试与验证"
-		},
-		"gpt": {
-			"provider": "openai",
-			"id": "gpt-6.1-sol",
-			"desc": "强推理，272K 上下文。算法、复杂调试、代码审查、方案推敲"
-		},
-		"opus": {
-			"provider": "anthropic",
-			"id": "claude-opus-5-5",
-			"desc": "最强。架构设计与任务编排、跨模块重构、疑难问题。不要用它执行机械步骤"
-		}
-	},
-	"fallback": "grok",
 	"contextWarn": {
 		"tokens": [300000],
 		"userTurns": 20
 	},
-	"confirmTimeoutSec": 30,
+	"confirmTimeoutSec": 0,
 	"dispatch": {
 		"inlineRoles": ["chore", "verifier"],
-		"inlineConfirmTimeoutSec": 10
+		"inlineConfirmTimeoutSec": 0
 	},
 	"features": {
 		"confirm": true,
 		"contextWarn": true,
-		"handoffAutoClose": true,
-		"windowSubagent": true,
-		"inlineSubagent": true,
-		"handoff": true
-	},
-	"policyAppend": ""
+		"handoffAutoClose": true
+	}
 }
