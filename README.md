@@ -1,12 +1,13 @@
 # pi-task-router
 
-[pi coding agent](https://github.com/earendil-works/pi) 扩展包：子任务分派策略，以及在当前窗口内同步执行子代理的 `subagent_inline` 工具。
+为 [Pi](https://github.com/earendil-works/pi) 提供显式子代理分派、任务交接和独立会话启动。默认留在当前会话，只有你要求时才分派或开新会话。
 
 ## 主要功能
 
 - **单窗口为主**：消息默认都在本会话处理，不对消息做自动判断或分流。只有用户主动使用命令/前缀（见[命令与前缀](#命令与前缀)），或在消息中明确要求开新窗口、子代理、交接时才分派。
 - **行为规则外置**：何时分派等规则写在 markdown 文件里，随模型能力变化只改规则文件，不改代码。
 - **分派前确认**：拦截 `subagent` / `subagent_inline` 调用，可执行、查看或编辑任务、换模型、取消；超时自动执行（可关闭）。
+- **[请求失败后接续](#请求失败后接续)**：在 herdr 中，模型请求最终失败后可选模型并在新窗口从已有进度接续；不切换原窗口的模型，不自动发送请求。
 - **`subagent_inline`**：在当前窗口另起 `pi` 子进程同步执行角色任务，结果直接作为工具返回值，不开新窗口。
 - **角色**：从 `~/.pi/agent/agents/*.md` 读取，格式与字段含义沿用 pi-herdr-subagents；task-router 不定义私有字段和特殊角色名。本包自带占位角色 `verifier`（验证）、`chore`（杂务）。
 
@@ -58,13 +59,19 @@ export PI_SUBAGENT_LAYOUT=split
 
 `subagent` / `subagent_inline` 调用前会弹出确认（`features.confirm`）：执行、查看或编辑任务、换模型（从 Pi 本地可用模型中选；并行时为全部使用同一模型）、取消；超时按 `confirmTimeoutSec` / `dispatch.inlineConfirmTimeoutSec` 自动执行（编辑或换模型后不再自动执行），Esc 取消。
 
+## 请求失败后接续
+
+在 herdr 中，普通 Pi 会话已保存到磁盘，且 Pi 的自动重试和恢复结束后模型请求仍失败，才会弹出「在新窗口接续 / 留在这里」。手动中止、单个工具报错和子代理会话不触发。选择接续后，在原窗口从 Pi 的本地可用模型中为新窗口选一个。取消就不开窗；原窗口不会换模型或关闭。
+
+新窗口用 Pi 原生 `--fork` 复制开窗时已保存的会话历史，保留失败轮中已有的工具记录，不回退、不写总结。两个窗口共享工作目录。新窗口核对会话来源和实际启用的模型后，才在输入框中填入接续草稿。你可以编辑，按 Enter 才会发送。此流程与 `<<` 普通交接独立，不受交接后自动关窗设置影响。
+
 ## 快速开始
 
 ### 依赖
 
 - [pi](https://github.com/earendil-works/pi) ≥ 1.3.0，必需。
-- [herdr](https://herdr.dev)，可选。开新窗口分派、交接和无关新任务开新窗口都需要在 herdr 中运行 pi。
-- [pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents)，提供开新窗口分派的 `subagent` 工具；在 herdr 中开新窗口时需要：`pi install npm:pi-herdr-subagents`。Windows 上还需要 PATH 中有 bash，例如把 Git Bash 的 `bin` 目录加入 PATH。
+- [herdr](https://herdr.dev)，可选。开新窗口分派、交接、独立新任务和请求失败后接续都需要在 herdr 中运行 Pi。
+- [pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents)，提供开新窗口分派的 `subagent` 工具：`pi install npm:pi-herdr-subagents`。Windows 上使用该工具还需要 PATH 中有 bash，例如把 Git Bash 的 `bin` 目录加入 PATH。
 
 不使用 herdr 时的行为见下文[不在 herdr 中运行时](#不在-herdr-中运行时)。
 
@@ -186,11 +193,11 @@ frontmatter 字段（均为 pi-herdr-subagents 的字段，含义一致；下表
 
 是否在 herdr 中，以环境变量 `HERDR_ENV=1` 且存在 `HERDR_PANE_ID` 判断。不在 herdr 中时：
 
-- **不可用**：开新窗口分派（包括 `>>`）、`handoff_open` 工具（不注册）、交接后自动关闭窗口。
+- **不可用**：开新窗口分派（包括 `>>`）、`handoff_open` 工具（不注册）、交接后自动关闭窗口、请求失败后在新窗口接续。
 - **改变行为**：所有可分派角色都用 `subagent_inline` 窗口内执行，`dispatch.inlineRoles` 不再起作用；`/route new` 和 `>>>` 的新任务也在窗口内执行；`/route handoff` 和 `<<` 只生成交接提示词，由你在新会话中使用。
 - **不受影响**：Pi 的 `/compact` 和 `/model`、分派确认、上下文提醒。
 
-在 herdr 中但没有安装 pi-herdr-subagents 时，`subagent` 工具不存在，开新窗口的角色无法分派；`handoff_open`（交接与无关新任务）和交接后自动关闭仍然可用。这种情况下把所有可分派角色写进 `dispatch.inlineRoles`。
+在 herdr 中但没有安装 pi-herdr-subagents 时，`subagent` 工具不存在，开新窗口的角色无法分派；`handoff_open`（交接与无关新任务）、交接后自动关闭和请求失败后接续仍然可用。这种情况下把所有可分派角色写进 `dispatch.inlineRoles`。
 
 ## 更新与卸载
 

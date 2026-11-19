@@ -753,13 +753,20 @@ function waitForPaneAgent(paneId: string, timeoutMs: number): void {
 }
 
 /** Windows pane 多为 PowerShell；herdr `agent start --kind pi` 会 Start-Process 无扩展的 npm `pi` 脚本。 */
-function startHandoffPi(paneId: string, agent: string, model: string, thinking: string): void {
-	assertHandoffArg(model, "model");
-	assertHandoffArg(thinking, "thinking");
+function startOrdinaryPi(paneId: string, agent: string, model: string, thinking: string, extraArgs: string[] = []): void {
+	const args = ["--model", model, "--thinking", thinking, ...extraArgs];
+	if (!extraArgs.length) {
+		assertHandoffArg(model, "model");
+		assertHandoffArg(thinking, "thinking");
+	}
 	if (IS_WIN32) {
+		// Recovery arguments include native paths. Decode them as data, not as PowerShell source.
+		const encoded = extraArgs.length ? Buffer.from(JSON.stringify(args), "utf8").toString("base64") : undefined;
 		const cmd = [
 			`Get-ChildItem Env: | Where-Object { $_.Name -ne '${SUBAGENT_LAYOUT_ENV}' -and (${WORKER_ENV_PREFIXES.map((p) => `$_.Name -like '${p}*'`).join(" -or ")}) } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }`,
-			`pi.cmd --model ${model} --thinking ${thinking}`,
+			encoded
+				? `$piArgs = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')) | ConvertFrom-Json; pi.cmd @piArgs`
+				: `pi.cmd --model ${model} --thinking ${thinking}`,
 		].join("; ");
 		sleepSync(1500);
 		execFileSync("herdr", ["pane", "run", paneId, cmd], { encoding: "utf8", timeout: 10_000 });
@@ -775,7 +782,7 @@ function startHandoffPi(paneId: string, agent: string, model: string, thinking: 
 		{ encoding: "utf8", timeout: 10_000 },
 	);
 	sleepSync(400);
-	herdrJson(["agent", "start", agent, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", "--model", model, "--thinking", thinking], 70_000);
+	herdrJson(["agent", "start", agent, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", ...args], 70_000);
 }
 
 function escapeRegExp(s: string): string {
@@ -926,10 +933,9 @@ async function moveHandoffTabAfterCurrent(ws: string, newTabId: string, newLabel
 	}
 }
 
-async function openHandoffSession(file: string, model: string, thinking: string, cwd: string): Promise<{ tabId: string; paneId: string; agent: string }> {
+async function openOrdinaryTab(model: string, thinking: string, cwd: string, extraArgs?: string[]): Promise<{ tabId: string; paneId: string; agent: string }> {
 	const ws = process.env.HERDR_WORKSPACE_ID;
 	if (!ws) throw new Error("找不到 HERDR_WORKSPACE_ID");
-	const filePrompt = toPromptPath(file);
 	const label = nextHandoffTabLabel();
 	const created = herdrJson(["tab", "create", "--workspace", ws, "--cwd", cwd, "--label", label, sourcePaneHasFocus() ? "--focus" : "--no-focus"]);
 	const tabId = created?.result?.tab?.tab_id;
@@ -938,13 +944,19 @@ async function openHandoffSession(file: string, model: string, thinking: string,
 	await moveHandoffTabAfterCurrent(ws, tabId, label);
 	const agent = `ho${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`.slice(0, 32);
 	try {
-		startHandoffPi(paneId, agent, model, thinking);
+		startOrdinaryPi(paneId, agent, model, thinking, extraArgs);
 	} catch (e) {
 		try {
 			execFileSync("herdr", ["tab", "close", tabId], { encoding: "utf8", timeout: 10_000 });
 		} catch {}
 		throw e;
 	}
+	return { tabId, paneId, agent };
+}
+
+async function openHandoffSession(file: string, model: string, thinking: string, cwd: string): Promise<{ tabId: string; paneId: string; agent: string }> {
+	const filePrompt = toPromptPath(file);
+	const { tabId, paneId, agent } = await openOrdinaryTab(model, thinking, cwd);
 	try {
 		try {
 			herdrJson(["agent", "prompt", agent, `读取交接文件 ${filePrompt} 并按其中「第一步」开始。`]);
@@ -955,6 +967,52 @@ async function openHandoffSession(file: string, model: string, thinking: string,
 		throw new Error(`新会话已启动（tab ${tabId}，pane ${paneId}），但发送交接指令失败，请在该窗口手动让它读取 ${filePrompt}：${e?.message ?? e}`);
 	}
 	return { tabId, paneId, agent };
+}
+
+const RECOVERY_FLAG = "task-router-recovery";
+const RECOVERY_DRAFT = "从本会话已有进度继续处理上一条尚未完成的用户请求。先根据对话和工具记录确认已完成的工作；如果某个操作是否成功不清楚，先核对现状，不要直接重做。只继续未完成的部分。";
+type RecoveryTarget = { sourceFile: string; sourceId: string; model: string };
+
+function readRecoveryTarget(flag: string): RecoveryTarget {
+	const target = JSON.parse(Buffer.from(flag, "base64url").toString("utf8")) as Partial<RecoveryTarget> | null;
+	if (!target || ![target.sourceFile, target.sourceId, target.model].every((value) => typeof value === "string" && value.length > 0)) {
+		throw new Error("恢复参数无效");
+	}
+	return target as RecoveryTarget;
+}
+
+function modelRef(model: { provider: string; id: string }): string {
+	return `${model.provider}/${model.id}`;
+}
+
+async function offerFailureRecovery(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const source = ctx.sessionManager;
+	if (!source.getSessionFile()) return;
+	const choice = await ctx.ui.select("模型请求失败", ["在新窗口接续", "留在这里"]);
+	if (choice !== "在新窗口接续") return;
+	const failedModel = ctx.model && modelRef(ctx.model);
+	const models = ctx.scopedModels?.length
+		? ctx.scopedModels.map(({ model }) => modelRef(model))
+		: [...availableModels(ctx).keys()];
+	if (!models.length) {
+		ctx.ui.notify("Pi 当前没有可选模型。原窗口已保留。", "warning");
+		return;
+	}
+	const choices = new Map([...new Set(models)].map((model) => [
+		model === failedModel ? `${model}（刚失败）` : model,
+		model,
+	]));
+	const selected = await ctx.ui.select("选择新窗口的模型（与原窗口共享工作目录）", [...choices.keys()]);
+	const model = selected === undefined ? undefined : choices.get(selected);
+	if (!model) return;
+	const sourceFile = source.getSessionFile();
+	if (!sourceFile || !existsSync(sourceFile)) throw new Error("找不到已保存的原会话");
+	const target: RecoveryTarget = { sourceFile, sourceId: source.getSessionId(), model };
+	const flag = Buffer.from(JSON.stringify(target), "utf8").toString("base64url");
+	// A file path identifies the exact session even when the workspace uses a custom session directory.
+	await openOrdinaryTab(model, pi.getThinkingLevel(), source.getCwd(), [
+		"--fork", sourceFile, "--session-dir", source.getSessionDir(), `--${RECOVERY_FLAG}`, flag,
+	]);
 }
 
 /** 等本进程真正退出后再关当前 pane。各平台统一用 node -e，逻辑与原先 sh 相同：kill(pid,0) 最多 60 秒，再 herdr pane get/close，失败写入 CLOSE_LOG_PATH。 */
@@ -1062,6 +1120,53 @@ export default function (pi: ExtensionAPI) {
 	let handoffPending = false;
 	let handoffOpened = false;
 	const enqueueDispatchConfirm = createSerialQueue();
+
+	pi.registerFlag(RECOVERY_FLAG, { type: "string", description: "Internal: prefill a verified failure-recovery session" });
+	let recoveryStartupHandled = false;
+	pi.on("session_start", (event, ctx) => {
+		if (recoveryStartupHandled || !IN_HERDR || IS_WORKER || !ctx.hasUI || event.reason !== "startup") return;
+		const flag = pi.getFlag(RECOVERY_FLAG);
+		if (typeof flag !== "string") return;
+		recoveryStartupHandled = true;
+		try {
+			const target = readRecoveryTarget(flag);
+			const session = ctx.sessionManager;
+			const parent = session.getHeader()?.parentSession;
+			if (!parent || resolve(parent) !== resolve(target.sourceFile) || session.getSessionId() === target.sourceId) {
+				throw new Error("新会话不是指定原会话的副本");
+			}
+			const actualModel = ctx.model && modelRef(ctx.model);
+			if (actualModel !== target.model) {
+				throw new Error(`所选模型 ${target.model}，实际模型 ${actualModel ?? "无"}`);
+			}
+			if (ctx.ui.getEditorText()) {
+				ctx.ui.notify("输入框已有内容，未覆盖为接续草稿。", "warning");
+				return;
+			}
+			ctx.ui.setEditorText(RECOVERY_DRAFT);
+		} catch (error) {
+			ctx.ui.notify(`未填入接续草稿：${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+	});
+
+	if (IN_HERDR && !IS_WORKER) {
+		let finalModelFailure = false;
+		pi.on("agent_end", (event) => {
+			// Keep the latest assistant result across retries; only act once Pi settles.
+			const last = event.messages.findLast((message) => message.role === "assistant");
+			if (last?.role === "assistant") finalModelFailure = last.stopReason === "error";
+		});
+		pi.on("agent_settled", async (event, ctx) => {
+			const failed = finalModelFailure;
+			finalModelFailure = false;
+			if (!failed || event.aborted || !ctx.hasUI || handoffOpened) return;
+			try {
+				await offerFailureRecovery(pi, ctx);
+			} catch (error) {
+				ctx.ui.notify(`接续开窗失败，原窗口已保留：${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		});
+	}
 
 	if (IN_HERDR && FEATURES.handoff) {
 		pi.registerTool({
